@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+data/
+gygo-data/
+.DS_Store

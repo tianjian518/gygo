@@ -1,0 +1,11 @@
+services:
+  gygo:
+    image: tianjian518/gygo:latest
+    container_name: gygo
+    ports:
+      - "5099:5099"
+    volumes:
+      - ./gygo-data:/data          # 监控项与登录态持久化，别删
+    environment:
+      - TZ=Asia/Shanghai
+    restart: unless-stopped
