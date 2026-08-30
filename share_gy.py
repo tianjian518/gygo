@@ -170,6 +170,9 @@ def get_share_token(share_id, passcode=""):
     payload = _public_post("get_share_summary", {"shareId": share_id})
     if _is_fail(payload):
         raise ShareError("分享不存在或已失效：" + _msg(payload), fatal=True)
+    # 分享标题在 summary 的 data.title 里
+    _sum = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    share_name = str(_sum.get("title") or _sum.get("shareName") or _sum.get("name") or "")
 
     payload = _public_post("get_share_access_token",
                            {"shareId": share_id, "code": passcode or ""})
@@ -183,10 +186,6 @@ def get_share_token(share_id, passcode=""):
             raise ShareError("提取码错误或分享不可访问", fatal=True)
         raise ShareError("提取码错误或分享不可访问（%s）" % _msg(payload), fatal=True)
 
-    share_name = ""
-    data = payload.get("data") or {}
-    if isinstance(data, dict):
-        share_name = str(data.get("shareName") or data.get("name") or "")
     return token, share_name
 
 
@@ -242,15 +241,20 @@ def _norm_share_item(it, prefix):
         if it.get(k):
             name = str(it[k])
             break
-    raw_dir = it.get("dir")
-    if raw_dir is None:
-        raw_dir = it.get("isDir")
-    if raw_dir is None:
-        raw_dir = it.get("isFolder")
-    is_dir = bool(raw_dir)
-    raw_type = it.get("fileType")
-    if raw_type is not None:
-        is_dir = str(raw_type) in ("2", "dir", "folder")
+    # 类型判断：光鸭分享接口用 resType（2=目录），个人盘接口用 type/dirType。
+    # 显式的布尔字段优先，其次按 type > resType > fileType > dirType 取值。
+    is_dir = None
+    for k in ("dir", "isDir", "is_dir", "isFolder"):
+        if it.get(k) is not None:
+            is_dir = bool(it[k])
+            break
+    if is_dir is None:
+        raw_type = None
+        for k in ("type", "resType", "fileType", "dirType"):
+            if it.get(k) is not None:
+                raw_type = it[k]
+                break
+        is_dir = str(raw_type) in ("2", "dir", "folder") if raw_type is not None else False
     try:
         size = int(it.get("size") or it.get("fileSize") or it.get("file_size") or 0)
     except (TypeError, ValueError):
