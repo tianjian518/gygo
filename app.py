@@ -6,18 +6,22 @@
 
 import json
 import os
+import signal
 import sys
 import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import gygo_log
 import monitor
 import monitor_store
-from guangya import ApiError, GuangyaClient, TokenExpired
+from guangya import ApiError, GuangyaClient, TokenExpired, ROOT_FID
 from share_gy import ShareError
 
 PORT = int(os.environ.get("PORT") or os.environ.get("GYGO_PORT") or 5099)
 HERE = os.path.dirname(os.path.abspath(__file__))
+VERSION = "1.1.0"
 
 # 全局状态
 CLIENT = None            # GuangyaClient 实例
@@ -115,16 +119,82 @@ def act_logout():
     return {"ok": True}
 
 
-def act_add_monitor(share_url, target_path, interval_min):
-    if CLIENT is None or AUTH_EXPIRED:
+def _need_client():
+    if CLIENT is None:
         raise ApiError("请先登录光鸭云盘")
-    mon = monitor.add_and_baseline(share_url, target_path, interval_min)
+    if AUTH_EXPIRED:
+        raise ApiError("登录已失效，请重新登录")
+    return CLIENT
+
+
+def act_add_monitor(share_url, target_path, interval_min, **opts):
+    _need_client()
+    if not share_url:
+        raise ApiError("请填写分享链接")
+    mon = monitor.add_and_baseline(share_url, target_path, interval_min, **opts)
     return {"ok": True, "monitor": mon}
 
 
+EDITABLE = ("target_path", "interval_min", "keep_tree", "include_kw",
+            "exclude_kw", "min_size_mb", "enabled")
+
+
+def act_update_monitor(mid, patch):
+    """改监控项配置。改目标路径不会重转已转存的文件（基线还在）。"""
+    m = monitor_store.get(mid)
+    if not m:
+        raise ApiError("监控项不存在")
+    clean = {}
+    for k in EDITABLE:
+        if k in patch and patch[k] is not None:
+            clean[k] = patch[k]
+    if "interval_min" in clean:
+        try:
+            clean["interval_min"] = max(monitor_store.MIN_INTERVAL,
+                                        int(clean["interval_min"]))
+        except (TypeError, ValueError):
+            clean.pop("interval_min")
+    if "min_size_mb" in clean:
+        try:
+            clean["min_size_mb"] = max(0, int(clean["min_size_mb"]))
+        except (TypeError, ValueError):
+            clean.pop("min_size_mb")
+    if "keep_tree" in clean:
+        clean["keep_tree"] = bool(clean["keep_tree"])
+    if "enabled" in clean:
+        clean["enabled"] = bool(clean["enabled"])
+    monitor_store.update(mid, **clean)
+    gygo_log.info("修改监控项", id=mid, fields=",".join(clean.keys()))
+    return {"ok": True, "monitor": monitor_store.get(mid)}
+
+
+def act_reset_baseline(mid):
+    """清空基线。下一轮扫描会把分享里所有文件当成"新出的"重新转存。
+
+    配合 MAX_PER_SCAN 分批，不会一次性灌爆。
+    """
+    m = monitor_store.get(mid)
+    if not m:
+        raise ApiError("监控项不存在")
+    monitor_store.update(mid, last_files=[], status="ok",
+                         last_result="基线已清空，下一轮将重新转存全部文件")
+    gygo_log.warn("基线已重置，下一轮将全量重转", id=mid,
+                  name=m.get("link_name") or "")
+    return {"ok": True, "monitor": monitor_store.get(mid)}
+
+
+def act_browse_dirs(fid):
+    """浏览自己网盘的目录，用来选转存目标。"""
+    c = _need_client()
+    items = c.list_dir(fid if fid not in (None, "") else ROOT_FID)
+    return {"ok": True, "fid": fid or ROOT_FID,
+            "items": [{"fid": it.get("fid"), "name": it.get("name"),
+                       "dir": bool(it.get("dir")), "size": it.get("size") or 0}
+                      for it in items if it.get("dir")]}
+
+
 def act_scan(mid):
-    if CLIENT is None or AUTH_EXPIRED:
-        raise ApiError("请先登录光鸭云盘")
+    _need_client()
     m = monitor_store.get(mid)
     if not m:
         raise ApiError("监控项不存在")
@@ -195,6 +265,31 @@ class Handler(BaseHTTPRequestHandler):
             items = monitor_store.list_all()
             return self._send(200, {"ok": True, "monitors": items})
 
+        if path == "/api/logs":
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            n = int((q.get("n") or ["200"])[0])
+            lv = (q.get("level") or [None])[0]
+            return self._send(200, {"ok": True, "logs": gygo_log.tail(n, lv)})
+
+        if path == "/api/health":
+            return self._send(200, {
+                "ok": True,
+                "version": VERSION,
+                "logged": CLIENT is not None and not AUTH_EXPIRED,
+                "expired": AUTH_EXPIRED,
+                "monitors": len(monitor_store.list_all()),
+                "running": sum(1 for m in monitor_store.list_all()
+                               if m.get("enabled") and m.get("status") != "invalid"),
+            })
+
+        if path == "/api/dirs":
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            fid = (q.get("fid") or [""])[0]
+            try:
+                return self._send(200, act_browse_dirs(fid))
+            except ApiError as e:
+                return self._send(200, {"ok": False, "msg": str(e)})
+
         return self._send(404, {"ok": False, "msg": "not found"})
 
     def do_POST(self):
@@ -214,14 +309,24 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {**act_logout(), "msg": "已退出"})
 
             if path == "/api/monitors":
-                r = act_add_monitor((data.get("share_url") or "").strip(),
-                                    (data.get("target_path") or "").strip(),
-                                    int(data.get("interval_min") or monitor_store.MIN_INTERVAL))
+                r = act_add_monitor(
+                    (data.get("share_url") or "").strip(),
+                    (data.get("target_path") or "").strip(),
+                    int(data.get("interval_min") or monitor_store.MIN_INTERVAL),
+                    keep_tree=data.get("keep_tree", True),
+                    include_kw=(data.get("include_kw") or "").strip(),
+                    exclude_kw=(data.get("exclude_kw") or "").strip(),
+                    min_size_mb=int(data.get("min_size_mb") or 0),
+                )
                 return self._send(200, r)
 
             if path.startswith("/api/monitors/") and path.endswith("/scan"):
                 mid = int(path.split("/")[3])
                 return self._send(200, act_scan(mid))
+
+            if path.startswith("/api/monitors/") and path.endswith("/reset"):
+                mid = int(path.split("/")[3])
+                return self._send(200, act_reset_baseline(mid))
 
             if path.startswith("/api/monitors/") and path.endswith("/toggle"):
                 mid = int(path.split("/")[3])
@@ -230,6 +335,17 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(404, {"ok": False, "msg": "监控项不存在"})
                 monitor_store.update(mid, enabled=not m.get("enabled", True))
                 return self._send(200, {"ok": True, "monitor": monitor_store.get(mid)})
+
+            # 编辑监控项：/api/monitors/{id}（只认三段，多的当未知路由）
+            if path.startswith("/api/monitors/"):
+                parts = path.strip("/").split("/")
+                if len(parts) != 3:
+                    return self._send(404, {"ok": False, "msg": "not found"})
+                try:
+                    mid = int(parts[2])
+                except ValueError:
+                    return self._send(400, {"ok": False, "msg": "参数错误"})
+                return self._send(200, act_update_monitor(mid, data))
         except ShareError as e:
             return self._send(200, {"ok": False, "msg": e.message})
         except TokenExpired:
@@ -267,15 +383,34 @@ def main():
     monitor.start_scheduler()
 
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    print("gygo 已启动 -> http://0.0.0.0:%d" % PORT)
+
+    def _shutdown(signum, _frame):
+        gygo_log.info("收到退出信号 %s，正在停止", signum)
+        try:
+            srv.shutdown()
+        except Exception:
+            pass
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _shutdown)
+        except (ValueError, OSError):
+            pass
+
+    gygo_log.info("gygo v%s 已启动 -> http://0.0.0.0:%d", VERSION, PORT)
+    print("gygo v%s 已启动 -> http://0.0.0.0:%d" % (VERSION, PORT))
     if CLIENT:
+        gygo_log.info("已恢复上次登录态（%s）", CLIENT.phone or "已登录")
         print("已恢复上次登录态（%s），监控运行中" % (CLIENT.phone or "已登录"))
     else:
         print("尚未登录，请打开网页用手机号短信登录")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
+        pass
+    finally:
         print("\n已停止")
+        gygo_log.info("已停止")
         srv.server_close()
 
 

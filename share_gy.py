@@ -5,9 +5,10 @@
 
 两个易错点：
   1. 分享列表 page 从 1 开始（个人盘从 0 开始）
-  2. 分享根目录 parentId 是空字符串 ""（个人盘根目录是 "0"）
+  2. 根目录 parentId 两边都是空字符串 ""（传 "0" 会静默返回空，别踩）
 """
 
+import json
 import re
 import time
 import urllib.error
@@ -273,45 +274,120 @@ def _norm_share_item(it, prefix):
 
 # ------------------------------------------------------------------ 转存
 
-def transfer_share_files(share_id, passcode, files, target_fid, client):
+def _rel_dir_of(item, share_name, keep_tree):
+    """算出某个文件在自己盘里应该放进哪个相对目录。
+
+    item["path"] 形如 "剧名/Season 01/S01E01.mp4"，目录部分就是 "剧名/Season 01"。
+    keep_tree=False 时一律平铺到目标目录。
+    """
+    if not keep_tree:
+        return ""
+    path = str(item.get("path") or item.get("name") or "")
+    parts = [p for p in path.replace("\\", "/").split("/") if p.strip()]
+    if len(parts) <= 1:
+        return ""                      # 本来就在根，不存在子目录
+    dirs = [p.strip() for p in parts[:-1]]
+    # 分享名常常就是最外层那个目录名（"醒来（2026）/S01E01.mp4"），
+    # 目标目录一般已经填了剧名，再套一层就变成 影视/醒来/醒来（2026）/ …
+    # 这里把与分享名一致的首层剥掉，避免多套一层。
+    if share_name and dirs:
+        def _norm(s):
+            return re.sub(r"[\s\[\]（）()【】]+", "", str(s)).lower()
+        if _norm(dirs[0]) == _norm(share_name):
+            dirs = dirs[1:]
+    # 目录名里可能有网盘不允许的字符，逐个清一下
+    clean = []
+    for d in dirs:
+        d = re.sub(r'[\\/:*?"<>|]+', "_", d).strip().strip(".")
+        if d and d not in (".", ".."):
+            clean.append(d)
+    return "/".join(clean)
+
+
+def transfer_share_files(share_id, passcode, files, target_fid, client,
+                         keep_tree=True, share_name=""):
     """把分享里的指定文件转存到自己的 target_fid 目录。
 
     client 必须已登录：restore_share 的请求头要用户 Bearer token，
     请求体里放的是分享的 accessToken —— 两个 token 含义不同，别混。
+
+    keep_tree=True 时，分享里的子目录结构会照搬到目标目录下
+    （多季剧不会全平铺在一起）。
+
+    返回 dict：
+      submitted 提交转存的文件数
+      ok        明确成功的批次数
+      fail      明确失败的批次数
+      timeout   超时未定的批次数（后台可能还在跑，不算失败）
+      detail    每批的说明文字
     """
+    result = {"submitted": 0, "ok": 0, "fail": 0, "timeout": 0, "detail": []}
     if not files:
-        return 0
-    token, _ = get_share_token(share_id, passcode)
-    fids = [f["fid"] for f in files if f.get("fid")]
-    if not fids:
-        return 0
+        return result
 
-    done = 0
-    for i in range(0, len(fids), BATCH_SIZE):
-        batch = fids[i:i + BATCH_SIZE]
-        payload = client._http(
-            "POST", API_RES + "/restore_share",
-            body={
-                "accessToken": token,           # 分享的 token
-                "fileIds": batch,
-                "parentId": "" if target_fid in ("0", "") else target_fid,
-            },
-            headers=client._res_headers(),      # 用户的 Bearer token
-        )
-        if client._is_fail(payload):
-            raise ShareError("转存失败：" + client._msg(payload))
-        task_id = (payload.get("taskId") or payload.get("task_id")
-                   or (payload.get("data") or {}).get("taskId")
-                   or (payload.get("data") or {}).get("task_id")
-                   or (payload.get("data") or {}).get("id"))
-        if task_id:
-            _wait_task(client, task_id)
-        done += len(batch)
-    return done
+    token, sname = get_share_token(share_id, passcode)
+    if not share_name:
+        share_name = sname or ""
+
+    # 按目标子目录分组：不同子目录要分别转存（光鸭一次只能指定一个 parentId）
+    buckets = {}
+    order = []
+    for f in files:
+        if not f.get("fid"):
+            continue
+        rel = _rel_dir_of(f, share_name, keep_tree)
+        if rel not in buckets:
+            buckets[rel] = []
+            order.append(rel)
+        buckets[rel].append(f)
+
+    for rel in order:
+        group = buckets[rel]
+        try:
+            dest_fid = client.resolve_path(rel, root_fid=target_fid) if rel else target_fid
+        except Exception as e:
+            result["fail"] += 1
+            result["detail"].append("[%s] 目录创建失败：%s" % (rel or "/", e))
+            continue
+
+        fids = [x["fid"] for x in group]
+        for i in range(0, len(fids), BATCH_SIZE):
+            batch = fids[i:i + BATCH_SIZE]
+            payload = client._http(
+                "POST", API_RES + "/restore_share",
+                body={
+                    "accessToken": token,           # 分享的 token
+                    "fileIds": batch,
+                    "parentId": dest_fid if dest_fid else "",
+                },
+                headers=client._res_headers(),      # 用户的 Bearer token
+            )
+            if client._is_fail(payload):
+                raise ShareError("转存失败：" + client._msg(payload))
+            result["submitted"] += len(batch)
+            task_id = (payload.get("taskId") or payload.get("task_id")
+                       or (payload.get("data") or {}).get("taskId")
+                       or (payload.get("data") or {}).get("task_id")
+                       or (payload.get("data") or {}).get("id"))
+            if not task_id:
+                result["ok"] += 1
+                result["detail"].append("[%s] 已提交 %d 个（接口未返回任务号）"
+                                        % (rel or "/", len(batch)))
+                continue
+            state, detail = wait_task(client, task_id)
+            result[state] += 1
+            result["detail"].append("[%s] %d 个 -> %s：%s"
+                                    % (rel or "/", len(batch), state, detail))
+    return result
 
 
-def _wait_task(client, task_id, max_poll=20, interval=1):
-    """轮询转存任务。超时不报错——任务可能还在后台跑，下轮扫描会发现文件已到位。"""
+def wait_task(client, task_id, max_poll=30, interval=1.5):
+    """轮询转存任务，返回 (state, detail)。
+
+    state: "ok" / "fail" / "timeout"
+    timeout 不算失败——光鸭后台可能还在跑，下轮扫描会发现文件已到位。
+    """
+    last = {}
     for _ in range(max_poll):
         try:
             payload = client._http(
@@ -319,21 +395,30 @@ def _wait_task(client, task_id, max_poll=20, interval=1):
                 body={"taskId": task_id},
                 headers=client._res_headers(),
             )
-        except ApiError:
-            return False
+        except ApiError as e:
+            return "timeout", "查询任务状态失败：%s" % e
         data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        last = data if isinstance(data, dict) else {}
         status = data.get("status")
         if status is None:
             status = data.get("taskStatus")
         if status is None:
             status = data.get("state")
         text = str(status or "").lower()
-        msg = str(data.get("message") or data.get("msg") or "").lower()
+        msg = str(data.get("message") or data.get("msg") or "")
+        low = msg.lower()
         if status in (2, 3, 4, "2", "3", "4") or text in (
                 "done", "success", "completed", "finish", "finished"):
-            return True
+            return "ok", msg or "完成"
         if status in (5, -1, "5", "-1") or text in ("failed", "error") \
-                or "失败" in msg or "failed" in msg or "error" in msg:
-            return False
+                or "失败" in msg or "failed" in low or "error" in low:
+            return "fail", msg or ("任务失败 status=%s" % status)
         time.sleep(interval)
-    return False
+    return "timeout", "等待超时（%d 秒），状态未定：%s" % (
+        int(max_poll * interval), json.dumps(last, ensure_ascii=False)[:120])
+
+
+def _wait_task(client, task_id, max_poll=30, interval=1.5):
+    """兼容旧调用：只返回布尔。"""
+    state, detail = wait_task(client, task_id, max_poll, interval)
+    return state == "ok"

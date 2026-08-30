@@ -1,0 +1,187 @@
+# -*- coding: utf-8 -*-
+"""gygo 核心逻辑自测 —— 不需要登录，不需要网络。
+
+    python3 tests/test_core.py
+
+覆盖：目录结构保持、过滤规则、单次转存限流、失败重试、基线推进。
+真实接口相关的验证请用 selftest.py（需网络，但无需登录）。
+"""
+import os
+import sys
+
+import shutil
+import tempfile
+
+_TMP = tempfile.mkdtemp(prefix="gygo-test-")
+os.environ["GYGO_DATA_DIR"] = _TMP
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import monitor
+import monitor_store
+from share_gy import _rel_dir_of
+
+PASS = FAIL = 0
+
+
+def check(name, got, want):
+    global PASS, FAIL
+    if got == want:
+        PASS += 1
+        print("  [OK]   %-42s -> %r" % (name, got))
+    else:
+        FAIL += 1
+        print("  [FAIL] %-42s -> %r (期望 %r)" % (name, got, want))
+
+
+print("=" * 66)
+print("A. 目录结构保持 _rel_dir_of")
+print("=" * 66)
+cases = [
+    # (path, share_name, keep_tree, 期望)
+    ("醒来（2026）/S01E01.mp4", "醒来（2026）", True, ""),           # 首层=分享名，剥掉
+    ("醒来（2026）/Season 01/S01E01.mp4", "醒来（2026）", True, "Season 01"),
+    ("剧名/Season 01/S01E01.mp4", "别的名字", True, "剧名/Season 01"),
+    ("S01E01.mp4", "醒来（2026）", True, ""),                        # 根目录文件
+    ("醒来（2026）/S01E01.mp4", "醒来（2026）", False, ""),           # 关掉保持结构
+    ("剧名/Season 01/S01E01.mp4", "x", False, ""),
+    ("醒来（2026）[tmdbid=1]/S01E01.mp4", "醒来（2026）[tmdbid=1]", True, ""),
+    ("A/B:S01/C/S01E01.mp4", "A", True, "B_S01/C"),                  # 非法字符清洗
+]
+for path, sname, keep, want in cases:
+    item = {"path": path, "name": path.split("/")[-1]}
+    check("%s | keep=%s" % (path, keep), _rel_dir_of(item, sname, keep), want)
+
+print("\n" + "=" * 66)
+print("B. 过滤规则 _apply_filters")
+print("=" * 66)
+
+
+def f(name, size_mb=500):
+    return {"fid": name, "name": name, "path": name,
+            "size": int(size_mb * 1024 * 1024)}
+
+
+files = [f("S01E01.mp4"), f("S01E02.mp4"), f("预告片.mp4"), f("花絮.mkv", 30),
+         f("S01E01.chs.srt", 1)]
+
+m = {"include_kw": "S01", "exclude_kw": "", "min_size_mb": 0}
+keep, drop = monitor._apply_filters(files, m)
+check("只留含 S01 的", [x["name"] for x in keep], ["S01E01.mp4", "S01E02.mp4", "S01E01.chs.srt"])
+
+m = {"include_kw": "S01", "exclude_kw": "srt", "min_size_mb": 0}
+keep, drop = monitor._apply_filters(files, m)
+check("再排除 srt", [x["name"] for x in keep], ["S01E01.mp4", "S01E02.mp4"])
+
+m = {"include_kw": "", "exclude_kw": "预告,花絮", "min_size_mb": 0}
+keep, drop = monitor._apply_filters(files, m)
+check("排除预告花絮", [x["name"] for x in keep],
+      ["S01E01.mp4", "S01E02.mp4", "S01E01.chs.srt"])
+
+m = {"include_kw": "", "exclude_kw": "", "min_size_mb": 100}
+keep, drop = monitor._apply_filters(files, m)
+check("最小 100MB", [x["name"] for x in keep],
+      ["S01E01.mp4", "S01E02.mp4", "预告片.mp4"])
+
+m = {"include_kw": "S01E0*", "exclude_kw": "", "min_size_mb": 0}
+keep, drop = monitor._apply_filters(files, m)
+check("通配 S01E0*", [x["name"] for x in keep], ["S01E01.mp4", "S01E02.mp4", "S01E01.chs.srt"])
+
+print("\n" + "=" * 66)
+print("C. 限流：一次新增 40 个，上限 20")
+print("=" * 66)
+
+# 造一个假 client + 假扫描环境
+class FakeClient(object):
+    def __init__(self):
+        self.calls = []
+        self.fail_next = False
+
+    def resolve_path(self, path, root_fid=""):
+        return "fid_root"
+
+    def list_dir(self, fid, **kw):
+        return []
+
+
+FC = FakeClient()
+CALLS = []
+
+
+def fake_list(sid, pwd, pdir, only_video=True):
+    return [{"fid": "fid%02d" % i, "name": "S01E%02d.mp4" % i,
+             "path": "剧/S01E%02d.mp4" % i, "size": 100} for i in range(1, 61)], "测试剧"
+
+
+def fake_transfer(sid, pwd, files, tgt, client, keep_tree=True, share_name=""):
+    CALLS.append([x["name"] for x in files])
+    if FC.fail_next:
+        FC.fail_next = False
+        return {"submitted": len(files), "ok": 0, "fail": 1, "timeout": 0,
+                "detail": ["模拟失败"]}
+    return {"submitted": len(files), "ok": 1, "fail": 0, "timeout": 0, "detail": ["完成"]}
+
+
+monitor.list_share_files = fake_list
+monitor.transfer_share_files = fake_transfer
+
+monitor.bind(type("A", (), {"CLIENT": FC, "AUTH_EXPIRED": False}), lambda v: None)
+
+# 建基线：60 个全在基线，不转存
+mon = monitor.add_and_baseline("https://www.guangyapan.com/s/xxx_yyy", "影视/测试", 60)
+check("建基线条数", len(mon["last_files"]), 60)
+check("建基线不转存", len(CALLS), 0)
+
+# 清空基线 → 模拟"60 集全是新的"
+monitor_store.update(mon["id"], last_files=[])
+r1 = monitor.scan_one(monitor_store.get(mon["id"]))
+check("第一轮转存数", r1.get("added"), 20)
+check("第一轮剩余排队", r1.get("pending"), 40)
+m1 = monitor_store.get(mon["id"])
+check("基线只推进 20", len(m1["last_files"]), 20)
+
+r2 = monitor.scan_one(monitor_store.get(mon["id"]))
+check("第二轮转存数", r2.get("added"), 20)
+check("第二轮剩余排队", r2.get("pending"), 20)
+
+r3 = monitor.scan_one(monitor_store.get(mon["id"]))
+check("第三轮转存数", r3.get("added"), 20)
+check("第三轮剩余排队", r3.get("pending"), 0)
+
+r4 = monitor.scan_one(monitor_store.get(mon["id"]))
+check("第四轮无新增", r4.get("added"), 0)
+check("累计转存 60 集", sum(len(c) for c in CALLS), 60)
+
+print("\n" + "=" * 66)
+print("D. 转存失败：基线不推进，下轮重试")
+print("=" * 66)
+monitor_store.update(mon["id"], last_files=[])
+CALLS.clear()
+FC.fail_next = True
+r = monitor.scan_one(monitor_store.get(mon["id"]))
+check("失败时状态", r.get("status"), "error")
+check("失败后基线为空", len(monitor_store.get(mon["id"])["last_files"]), 0)
+
+r = monitor.scan_one(monitor_store.get(mon["id"]))
+check("下轮自动重试并成功", r.get("added"), 20)
+check("重试后基线推进", len(monitor_store.get(mon["id"])["last_files"]), 20)
+
+print("\n" + "=" * 66)
+print("E. 被过滤的文件也会进基线（不会每轮重复判定）")
+print("=" * 66)
+monitor_store.remove(mon["id"])
+mon2 = monitor.add_and_baseline("https://www.guangyapan.com/s/xxx_yyy", "影视/测试", 60,
+                                include_kw="不存在的关键词")
+check("建基线全量 60", len(mon2["last_files"]), 60)
+monitor_store.update(mon2["id"], last_files=[])
+CALLS.clear()
+r = monitor.scan_one(monitor_store.get(mon2["id"]))
+check("全被过滤，转存 0", r.get("added"), 0)
+check("过滤数 60", r.get("filtered"), 60)
+check("但基线已推进 60", len(monitor_store.get(mon2["id"])["last_files"]), 60)
+r = monitor.scan_one(monitor_store.get(mon2["id"]))
+check("下轮不再有新增", r.get("added"), 0)
+
+print("\n" + "=" * 66)
+print("结果：通过 %d 项，失败 %d 项" % (PASS, FAIL))
+print("=" * 66)
+sys.exit(1 if FAIL else 0)

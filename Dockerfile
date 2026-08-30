@@ -6,7 +6,9 @@ LABEL org.opencontainers.image.description="光鸭云盘分享链接追更监控
 WORKDIR /app
 
 # 只拷贝运行需要的文件，主流程零第三方依赖，无需 pip install
-COPY guangya.py share_gy.py monitor.py monitor_store.py app.py selftest.py index.html ./
+COPY guangya.py share_gy.py monitor.py monitor_store.py gygo_log.py app.py \
+     selftest.py index.html ./
+COPY tests/ ./tests/
 
 ENV GYGO_DATA_DIR=/data \
     PYTHONUNBUFFERED=1 \

@@ -12,14 +12,20 @@
   - 网络等临时错误 → status=error，下个周期自动重试
 """
 
+import re
 import threading
 import time
 
+import gygo_log
 import monitor_store
 from monitor_store import MIN_INTERVAL
 from guangya import ApiError, TokenExpired
 from share_gy import (ShareError, list_share_files, parse_share_input,
                       transfer_share_files)
+
+# 单轮最多转存多少个文件。分享方一次性补更几十集时，分批慢慢转，
+# 一口气全塞进去容易触发光鸭风控，也容易把免费号的每日额度打满。
+MAX_PER_SCAN = 20
 
 # 与 app.py 解耦：启动时由 app 把自己的模块绑进来，避免循环 import
 _CLIENT_GETTER = None
@@ -103,16 +109,35 @@ def scan_one(monitor, on_phase=None):
     prev = set(monitor.get("last_files") or [])
     new_files = [f for f in files if f.get("fid") and f["fid"] not in prev]
 
+    # 3.5) 过滤规则：关键词 / 扩展名 / 最小体积
+    new_files, filtered = _apply_filters(new_files, monitor)
+    if filtered:
+        gygo_log.info("过滤掉 %d 个文件", len(filtered),
+                      monitor=monitor.get("link_name"))
+
+    # 3.6) 限流：一轮最多转 MAX_PER_SCAN 个，剩下的留到下一轮
+    pending = 0
+    if len(new_files) > MAX_PER_SCAN:
+        pending = len(new_files) - MAX_PER_SCAN
+        gygo_log.warn("单次新增 %d 个，超过上限 %d，本轮只转前 %d 个",
+                      len(new_files), MAX_PER_SCAN, MAX_PER_SCAN,
+                      monitor=monitor.get("link_name"))
+        new_files = new_files[:MAX_PER_SCAN]
+
     added = 0
+    transfer = {"submitted": 0, "ok": 0, "fail": 0, "timeout": 0, "detail": []}
     if new_files:
         _phase("转存新增", count=len(new_files))
         if _expired():
             monitor_store.update(mid, status="paused")
             return {"status": "paused", "msg": "登录已失效，暂停监控"}
         try:
-            added = transfer_share_files(
+            transfer = transfer_share_files(
                 monitor["share_id"], monitor.get("passcode") or "",
-                new_files, target_fid, client)
+                new_files, target_fid, client,
+                keep_tree=monitor.get("keep_tree", True),
+                share_name=monitor.get("link_name") or "")
+            added = transfer.get("submitted", 0)
         except ShareError as e:
             if e.fatal:
                 monitor_store.update(mid, status="invalid",
@@ -131,15 +156,92 @@ def scan_one(monitor, on_phase=None):
                                  last_result="转存失败：%s" % e, last_scan=_now())
             return {"status": "error", "msg": str(e)}
 
-    summary = ("%s 扫描：新增 %d 个视频，已转存（共 %d）" % (_now(), added, len(files))
-               if added else ("%s 扫描：无新增（共 %d）" % (_now(), len(files))))
-    monitor_store.update(mid, last_files=cur_ids, last_scan=_now(),
-                         status="ok", last_result=summary)
+    # 基线推进：只有确认成功（或超时但不算失败）的才写进基线，
+    # 明确失败的留着下轮重试；被过滤掉的也写进去，免得每轮都当新增。
+    kept_ids = set(f["fid"] for f in filtered if f.get("fid"))
+    if transfer.get("fail"):
+        failed_note = "；".join(transfer.get("detail") or [])
+        summary = "%s 扫描：转存失败，下轮重试（%s）" % (_now(), failed_note[:180])
+        gygo_log.error("转存失败", monitor=monitor.get("link_name"),
+                       detail=failed_note[:200])
+        monitor_store.update(mid, last_files=sorted(set(prev) | kept_ids),
+                             last_scan=_now(), status="error",
+                             last_result=summary)
+        _phase("完成", added=0)
+        return {"status": "error", "added": 0, "total": len(files),
+                "msg": summary}
+
+    done_ids = set(f["fid"] for f in new_files if f.get("fid"))
+    if transfer.get("timeout"):
+        gygo_log.warn("转存任务超时未确认，按成功处理",
+                      monitor=monitor.get("link_name"),
+                      n=transfer.get("timeout"))
+
+    tail = ""
+    if pending:
+        tail = "，还有 %d 个排队等下一轮" % pending
+    if filtered:
+        tail += "，过滤掉 %d 个" % len(filtered)
+    summary = ("%s 扫描：新增 %d 个，已转存（共 %d）%s"
+               % (_now(), added, len(files), tail)) if added else (
+               "%s 扫描：无新增（共 %d）%s" % (_now(), len(files), tail))
+
+    monitor_store.update(mid, last_files=sorted(set(prev) | kept_ids | done_ids),
+                         last_scan=_now(), status="ok", last_result=summary)
     _phase("完成", added=added)
-    return {"status": "ok", "added": added, "total": len(files)}
+    return {"status": "ok", "added": added, "total": len(files),
+            "pending": pending, "filtered": len(filtered),
+            "transfer": {k: v for k, v in transfer.items() if k != "detail"}}
 
 
-def add_and_baseline(share_url, target_path, interval_min, pdir_fid=""):
+def _match_keywords(name, raw):
+    """raw 是用户填的规则串，逗号/空格/换行分隔，支持 * 通配。"""
+    parts = [p.strip() for p in re.split(r"[,，\s]+", str(raw or "")) if p.strip()]
+    if not parts:
+        return True
+    low = str(name or "").lower()
+    for p in parts:
+        pl = p.lower()
+        if "*" in pl:
+            pat = "^" + re.escape(pl).replace(r"\*", ".*") + "$"
+            if re.match(pat, low):
+                return True
+        elif pl in low:
+            return True
+    return False
+
+
+def _apply_filters(files, monitor):
+    """按监控项上的过滤规则筛文件。返回 (留下的, 被过滤掉的)。"""
+    inc = monitor.get("include_kw") or ""
+    exc = monitor.get("exclude_kw") or ""
+    try:
+        min_mb = int(monitor.get("min_size_mb") or 0)
+    except (TypeError, ValueError):
+        min_mb = 0
+
+    if not inc and not exc and min_mb <= 0:
+        return files, []
+
+    keep, drop = [], []
+    for f in files:
+        name = f.get("name") or f.get("path") or ""
+        if min_mb > 0 and int(f.get("size") or 0) < min_mb * 1024 * 1024:
+            drop.append(f)
+            continue
+        if inc and not _match_keywords(name, inc):
+            drop.append(f)
+            continue
+        if exc and _match_keywords(name, exc):
+            drop.append(f)
+            continue
+        keep.append(f)
+    return keep, drop
+
+
+def add_and_baseline(share_url, target_path, interval_min, pdir_fid="",
+                     keep_tree=True, include_kw="", exclude_kw="",
+                     min_size_mb=0):
     """新增监控项，并立刻拉一次链接建立基线（已存在的文件不会被转存）。"""
     share_id, passcode, parsed_pdir = parse_share_input(share_url)
     if not pdir_fid:
@@ -152,16 +254,26 @@ def add_and_baseline(share_url, target_path, interval_min, pdir_fid=""):
         "pdir_fid": pdir_fid or "",
         "target_path": target_path or "",
         "interval_min": interval_min,
+        "keep_tree": bool(keep_tree),
+        "include_kw": include_kw or "",
+        "exclude_kw": exclude_kw or "",
+        "min_size_mb": int(min_size_mb or 0),
     })
 
     # 建立基线：列一次分享，把当前所有文件记下来
     link_name = ""
     try:
         files, link_name = list_share_files(share_id, passcode, pdir_fid or "", only_video=True)
+        _kept, dropped = _apply_filters(files, mon)
+        note = "（过滤掉 %d 个）" % len(dropped) if dropped else ""
         monitor_store.update(mon["id"],
                              last_files=[f["fid"] for f in files if f.get("fid")],
                              link_name=link_name, last_scan=_now(), status="ok",
-                             last_result="已添加，基线 %d 个视频（这些不会被转存）" % len(files))
+                             last_result="已添加，基线 %d 个视频%s（这些不会被转存）"
+                                         % (len(files), note))
+        gygo_log.info("新增监控：%s", link_name or share_url,
+                      baseline=len(files), dropped=len(dropped),
+                      target=target_path or "(根目录)")
     except ShareError as e:
         monitor_store.update(mon["id"], status="error" if not e.fatal else "invalid",
                              last_result="建立基线失败：" + e.message)
@@ -176,6 +288,7 @@ class MonitorScheduler(threading.Thread):
         threading.Thread.__init__(self)
         self.daemon = True
         self._stop = threading.Event()
+        self._busy = set()          # 正在扫描的监控项 id，防止重叠
 
     def run(self):
         while not self._stop.is_set():
@@ -188,6 +301,9 @@ class MonitorScheduler(threading.Thread):
                     continue
                 if m.get("status") == "invalid":
                     continue
+                mid = m["id"]
+                if mid in self._busy:
+                    continue
                 iv = max(MIN_INTERVAL, int(m.get("interval_min") or MIN_INTERVAL)) * 60
                 last = m.get("last_scan")
                 if not last:
@@ -199,11 +315,23 @@ class MonitorScheduler(threading.Thread):
                     except Exception:
                         due = True
                 if due:
+                    self._busy.add(mid)
                     try:
-                        scan_one(m)
+                        r = scan_one(m)
+                        if r.get("status") == "ok" and r.get("added"):
+                            gygo_log.info("自动扫描完成：%s 新增 %d 个",
+                                          m.get("link_name") or m.get("share_url"),
+                                          r.get("added"))
+                        elif r.get("status") == "error":
+                            gygo_log.warn("自动扫描出错：%s %s",
+                                          m.get("link_name") or m.get("share_url"),
+                                          r.get("msg") or "")
                     except Exception as e:
-                        monitor_store.update(m["id"], status="error",
+                        monitor_store.update(mid, status="error",
                                              last_result="扫描异常：%s" % e)
+                        gygo_log.error("扫描异常", monitor=mid, err=str(e))
+                    finally:
+                        self._busy.discard(mid)
 
     def stop(self):
         self._stop.set()
