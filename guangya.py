@@ -25,10 +25,21 @@ WEB_ORIGIN = "https://www.guangyapan.com"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36")
 
-ROOT_FID = "0"          # 个人盘根目录
-ROOT_SHARE_PARENT = ""  # 分享列表根目录用空字符串，注意别混
+# 实测（2026-08-30）：光鸭个人盘和分享列表的根目录都是空字符串。
+# 传 "0" 接口不报错，只会静默返回空 data —— 表现为"列目录永远为空、
+# 建目录报父目录不存在"，排查时非常坑，这里统一按 "" 处理。
+ROOT_FID = ""           # 个人盘根目录
+ROOT_SHARE_PARENT = ""  # 分享列表根目录
 
 TIMEOUT = 30
+
+
+def _norm_fid(fid):
+    """把 '0' / 'root' / '/' / None 这些历史写法统一成光鸭认可的根目录 ''。"""
+    if fid is None:
+        return ""
+    s = str(fid).strip()
+    return "" if s in ("0", "root", "/") else s
 
 
 def generate_did():
@@ -280,6 +291,7 @@ class GuangyaClient(object):
 
     def list_dir(self, parent_id, page_size=100, max_pages=200):
         """列出个人盘某目录下的文件/文件夹。page 从 0 开始。"""
+        parent_id = _norm_fid(parent_id)
         items = []
         for page in range(max_pages):
             payload = self._http(
@@ -296,6 +308,10 @@ class GuangyaClient(object):
             )
             if self._is_fail(payload):
                 raise ApiError(self._msg(payload))
+            # 光鸭对不存在的 parentId 不报错，只回 data:{}，
+            # 静默当空目录处理会导致"目录丢了还以为没文件"，这里显式拦一下。
+            if not isinstance(payload.get("data"), dict):
+                raise ApiError("目录不存在或无权访问：%r" % parent_id)
             batch = _extract_list(payload)
             if not batch:
                 break
@@ -307,7 +323,8 @@ class GuangyaClient(object):
     def create_dir(self, parent_id, name):
         payload = self._http(
             "POST", API_RES + "/file/create_dir",
-            body={"parentId": parent_id, "dirName": name, "failIfNameExist": False},
+            body={"parentId": _norm_fid(parent_id), "dirName": name,
+                  "failIfNameExist": False},
             headers=self._res_headers(),
         )
         if self._is_fail(payload):
@@ -317,6 +334,21 @@ class GuangyaClient(object):
             if data.get(k):
                 return str(data[k])
         return None
+
+    def delete_files(self, fids):
+        """删除文件/目录（异步任务，返回 taskId）。fids 是列表。"""
+        if not fids:
+            return None
+        payload = self._http(
+            "POST", API_RES + "/file/delete_file",
+            body={"fileIds": [str(x) for x in fids]},
+            headers=self._res_headers(),
+        )
+        if self._is_fail(payload):
+            raise ApiError("删除失败：" + self._msg(payload))
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        return (data.get("taskId") or data.get("task_id")
+                or data.get("id") or None)
 
     def find_or_create_dir(self, name, parent_id=ROOT_FID):
         """在 parent_id 下找同名目录，没有就建一个，返回其 fid。"""
