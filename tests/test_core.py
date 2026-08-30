@@ -51,22 +51,24 @@ print("=" * 66)
 print("B. 目录结构保持 _rel_dir_of")
 print("=" * 66)
 cases = [
-    # (path, share_name, keep_tree, 期望)
-    ("醒来（2026）/S01E01.mp4", "醒来（2026）", True, ""),           # 首层=分享名，剥掉
-    ("醒来（2026）/Season 01/S01E01.mp4", "醒来（2026）", True, "Season 01"),
+    # (path, share_name, keep_tree, 期望)  —— 外层文件夹一律保留，不剥离
+    ("醒来（2026）/S01E01.mp4", "醒来（2026）", True, "醒来（2026）"),
+    ("醒来（2026）/Season 01/S01E01.mp4", "醒来（2026）", True, "醒来（2026）/Season 01"),
     ("剧名/Season 01/S01E01.mp4", "别的名字", True, "剧名/Season 01"),
     ("S01E01.mp4", "醒来（2026）", True, ""),                        # 根目录文件
     ("醒来（2026）/S01E01.mp4", "醒来（2026）", False, ""),           # 关掉保持结构
     ("剧名/Season 01/S01E01.mp4", "x", False, ""),
-    ("醒来（2026）[tmdbid=1]/S01E01.mp4", "醒来（2026）[tmdbid=1]", True, ""),
-    ("A/B:S01/C/S01E01.mp4", "A", True, "B_S01/C"),                  # 非法字符清洗
+    ("醒来（2026）[tmdbid=1]/S01E01.mp4", "醒来（2026）[tmdbid=1]", True, "醒来（2026）[tmdbid=1]"),
+    # 同名外层文件夹包视频：整层都要保留
+    ("Charlies.Angels.2019.2160p/movie.mkv", "Charlies.Angels.2019.2160p", True, "Charlies.Angels.2019.2160p"),
+    ("A/B:S01/C/S01E01.mp4", "A", True, "A/B_S01/C"),                # 非法字符清洗
 ]
 for path, sname, keep, want in cases:
     item = {"path": path, "name": path.split("/")[-1]}
     check("%s | keep=%s" % (path, keep), _rel_dir_of(item, sname, keep), want)
 
 print("\n" + "=" * 66)
-print("B. 过滤规则 _apply_filters")
+print("C. 过滤规则 _apply_filters")
 print("=" * 66)
 
 

@@ -373,6 +373,22 @@ class GuangyaClient(object):
         return (data.get("taskId") or data.get("task_id")
                 or data.get("id") or None)
 
+    def move_files(self, fids, parent_id):
+        """把文件/目录移动到 parent_id 下（异步任务，返回 taskId）。"""
+        if not fids:
+            return None
+        payload = self._http(
+            "POST", API_RES + "/file/move_file",
+            body={"fileIds": [str(x) for x in fids],
+                  "parentId": _norm_fid(parent_id)},
+            headers=self._res_headers(),
+        )
+        if self._is_fail(payload):
+            raise ApiError("移动失败：" + self._msg(payload))
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        return (data.get("taskId") or data.get("task_id")
+                or data.get("id") or None)
+
     def find_or_create_dir(self, name, parent_id=ROOT_FID):
         """在 parent_id 下找同名目录，没有就建一个，返回其 fid。"""
         for it in self.list_dir(parent_id):

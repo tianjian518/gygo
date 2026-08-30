@@ -279,6 +279,10 @@ def _rel_dir_of(item, share_name, keep_tree):
 
     item["path"] 形如 "剧名/Season 01/S01E01.mp4"，目录部分就是 "剧名/Season 01"。
     keep_tree=False 时一律平铺到目标目录。
+
+    注意：分享里原有的子目录（含与分享同名的那一层）**全部保留**，
+    原样镜像到目标目录下。光鸭分享经常是「同名文件夹包着视频」的结构，
+    剥掉那层会导致外层文件夹丢失，所以不做任何剥离。
     """
     if not keep_tree:
         return ""
@@ -287,14 +291,6 @@ def _rel_dir_of(item, share_name, keep_tree):
     if len(parts) <= 1:
         return ""                      # 本来就在根，不存在子目录
     dirs = [p.strip() for p in parts[:-1]]
-    # 分享名常常就是最外层那个目录名（"醒来（2026）/S01E01.mp4"），
-    # 目标目录一般已经填了剧名，再套一层就变成 影视/醒来/醒来（2026）/ …
-    # 这里把与分享名一致的首层剥掉，避免多套一层。
-    if share_name and dirs:
-        def _norm(s):
-            return re.sub(r"[\s\[\]（）()【】]+", "", str(s)).lower()
-        if _norm(dirs[0]) == _norm(share_name):
-            dirs = dirs[1:]
     # 目录名里可能有网盘不允许的字符，逐个清一下
     clean = []
     for d in dirs:
