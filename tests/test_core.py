@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import monitor
 import monitor_store
 from share_gy import _rel_dir_of
+from guangya import normalize_phone
 
 PASS = FAIL = 0
 
@@ -34,7 +35,20 @@ def check(name, got, want):
 
 
 print("=" * 66)
-print("A. 目录结构保持 _rel_dir_of")
+print("A. 手机号规范化 normalize_phone（修复 captcha_invalid）")
+print("=" * 66)
+for raw, want in [
+    ("18155958936", "+8618155958936"),
+    ("8618155958936", "+8618155958936"),
+    ("+86 181 5595 8936", "+8618155958936"),
+    ("+8618155958936", "+8618155958936"),
+    ("abc123", "abc123"),          # 非标准原样返回
+    ("", ""),
+]:
+    check("normalize(%r)" % raw, normalize_phone(raw), want)
+
+print("=" * 66)
+print("B. 目录结构保持 _rel_dir_of")
 print("=" * 66)
 cases = [
     # (path, share_name, keep_tree, 期望)

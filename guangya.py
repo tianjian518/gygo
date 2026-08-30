@@ -12,6 +12,7 @@
 
 import hashlib
 import json
+import re
 import secrets
 import time
 import urllib.error
@@ -45,6 +46,25 @@ def _norm_fid(fid):
 def generate_did():
     """设备 ID：md5(随机16字节hex)，32 位。"""
     return hashlib.md5(secrets.token_hex(16).encode("utf-8")).hexdigest()
+
+
+def normalize_phone(phone):
+    """把用户输入的手机号统一成 +86 前缀格式。
+
+    光鸭服务端会把 captcha 里的手机号格式化为 ``+86...`` 再比对，
+    若登录时传的原始输入没带 +86，就会报 captcha_invalid。
+    这里统一在入口处规范化，用户输 ``18155958936`` / ``86181...`` /
+    ``+86 181...`` 都能正常登录。
+    """
+    if not phone:
+        return ""
+    s = re.sub(r"\s+", "", str(phone))
+    s = s.lstrip("+").lstrip("86") if s.startswith(("+86", "86")) else s
+    s = re.sub(r"^\D*?(\d{11})$", r"\1", s)  # 去掉可能存在的其他前缀/分隔符，仅保留11位
+    digits = re.sub(r"\D", "", s)
+    if len(digits) == 11:
+        return "+86" + digits
+    return phone  # 非标准号码原样返回，交给接口报错
 
 
 def generate_traceparent():
@@ -184,6 +204,7 @@ class GuangyaClient(object):
 
     def sms_init(self, phone):
         """第一步：拿人机验证票据 captcha_token。"""
+        phone = normalize_phone(phone)
         payload = self._http(
             "POST", API_ACCOUNT + "/shield/captcha/init",
             body={
@@ -205,6 +226,7 @@ class GuangyaClient(object):
 
     def sms_send(self, phone, captcha_token):
         """第二步：发短信，返回 verification_id。"""
+        phone = normalize_phone(phone)
         payload = self._http(
             "POST", API_ACCOUNT + "/auth/verification",
             body={"phone_number": phone, "target": "ANY", "client_id": CLIENT_ID},
@@ -237,6 +259,7 @@ class GuangyaClient(object):
 
     def sms_signin(self, phone, code, verification_token, captcha_token):
         """第四步：正式登录，拿到 access_token / refresh_token。"""
+        phone = normalize_phone(phone)
         payload = self._http(
             "POST", API_ACCOUNT + "/auth/signin",
             body={
