@@ -418,3 +418,39 @@ def start_scheduler():
         _scheduler = MonitorScheduler()
         _scheduler.start()
     return _scheduler
+
+
+def scan_now(mid):
+    """立即在后台扫描某个监控项（不阻塞当前 HTTP 请求）。
+
+    用于：添加链接后、登录成功后，让用户立刻看到效果，而不是干等一个
+    扫描周期。重复触发会被调度器的 _busy 去重，不会和定时扫描重叠扫同一个。
+    """
+    global _scheduler
+    sch = _scheduler
+    if sch is None or not sch.is_alive():
+        sch = start_scheduler()
+    if mid in sch._busy:
+        return False
+
+    def _run():
+        try:
+            m = monitor_store.get(mid)
+            if not m or not m.get("enabled"):
+                return
+            if _client() is None:
+                return
+            if _expired():
+                monitor_store.update(mid, status="paused")
+                return
+            scan_one(m)
+        except Exception as e:
+            gygo_log.error("即时扫描异常", monitor=mid, err=str(e))
+        finally:
+            sch._busy.discard(mid)
+
+    sch._busy.add(mid)
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    return True
+

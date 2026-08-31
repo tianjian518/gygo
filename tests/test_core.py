@@ -8,6 +8,7 @@
 """
 import os
 import sys
+import time
 
 import shutil
 import tempfile
@@ -216,6 +217,42 @@ m_trackonly = monitor.add_and_baseline(
     transfer_existing=False, client=FC)
 check("只追新→建基线 60 条", len(m_trackonly["last_files"]), 60)
 check("只追新→不转存", len(CALLS), 0)
+
+print("\n" + "=" * 66)
+print("G. 添加/登录后即时扫描 scan_now")
+print("=" * 66)
+
+# 准备 scan_now 的后台环境（用假调度器，不启动真实线程/扫描）
+monitor._CLIENT_GETTER = lambda: FC
+monitor._EXPIRED_GETTER = lambda: False
+class _FakeSch:
+    _busy = set()
+    def is_alive(self):
+        return True
+monitor._scheduler = _FakeSch()
+
+# 把 scan_one 换成记录调用的假函数，验证 scan_now 真的在后台调了它
+hits = []
+def _fake_scan_one(m):
+    hits.append(m["id"])
+    return {"status": "ok", "added": 0, "total": 0}
+_orig_scan_one = monitor.scan_one
+monitor.scan_one = _fake_scan_one
+try:
+    mg = monitor.add_and_baseline(
+        "https://www.guangyapan.com/s/1111111111111111_aBcDeFgHiJkLmNoP", "影视/X", 60,
+        transfer_existing=False, client=FC)
+    ok = monitor.scan_now(mg["id"])
+    time.sleep(0.5)  # 等后台线程跑完
+    check("scan_now 返回 True", ok, True)
+    check("scan_now 真的后台调了 scan_one", len(hits), 1)
+    check("scan_now 扫的是目标监控项", (hits and hits[0]), mg["id"])
+    monitor_store.remove(mg["id"])
+finally:
+    monitor.scan_one = _orig_scan_one
+    monitor._scheduler = None
+    monitor._CLIENT_GETTER = None
+    monitor._EXPIRED_GETTER = None
 
 print("\n" + "=" * 66)
 print("结果：通过 %d 项，失败 %d 项" % (PASS, FAIL))

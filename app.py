@@ -21,7 +21,7 @@ from share_gy import ShareError
 
 PORT = int(os.environ.get("PORT") or os.environ.get("GYGO_PORT") or 5099)
 HERE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 
 # 全局状态
 CLIENT = None            # GuangyaClient 实例
@@ -106,6 +106,12 @@ def act_sms_login(phone, code):
     for m in monitor_store.list_all():
         if m.get("status") == "paused":
             monitor_store.update(m["id"], status="ok")
+    # 立即扫描待处理的监控项（pending / 还没建基线的），不用等下一个周期
+    for m in monitor_store.list_all():
+        if not m.get("enabled") or m.get("status") == "invalid":
+            continue
+        if m.get("status") == "pending" or not m.get("last_files"):
+            monitor.scan_now(m["id"])
     return {"ok": True, "phone": c.phone}
 
 
@@ -136,6 +142,9 @@ def act_add_monitor(share_url, target_path, interval_min, **opts):
     mon = monitor.add_and_baseline(
         share_url, target_path, interval_min,
         transfer_existing=transfer_existing, client=CLIENT, **opts)
+    # 已登录就立刻在后台扫一次，不用等下一个周期（已转存的判为空差集，不重复）
+    if CLIENT is not None and not AUTH_EXPIRED:
+        monitor.scan_now(mon["id"])
     return {"ok": True, "monitor": mon}
 
 
