@@ -296,39 +296,64 @@ def add_and_baseline(share_url, target_path, interval_min, pdir_fid="",
             gygo_log.warn("添加时目标目录解析失败，仅建基线", id=mid)
             return monitor_store.get(mid)
 
+        # 被过滤掉的文件永不转存，先把它们的 fid 记进基线，
+        # 否则以后每一轮扫描都会把它们当"新增"重新判定。
+        baseline_ids = set(f["fid"] for f in dropped if f.get("fid"))
+        # 先建一份"最小基线"再开始转存。这样即便有并发扫描抢跑，
+        # 它读到的是这份基线，不会把还没转的文件误判成新增重复转存。
+        monitor_store.update(mid, last_files=sorted(baseline_ids),
+                             link_name=link_name, last_scan=_now(), status="ok",
+                             last_result="已添加，正在转存已有视频%s" % note)
+
+        # 占住 _busy：转存期间不让 scan_now / 自动扫描 / 手动扫描抢跑，
+        # 否则会趁基线还没记全、把整批已转文件当"新增"又转一遍 —— 这就是
+        # 20 集变成 40 集（每集一个副本）的元凶。
+        sch = _scheduler
+        if sch is None or not sch.is_alive():
+            sch = start_scheduler()
+        hold = mid not in sch._busy
+        if hold:
+            sch._busy.add(mid)
+
         transferred, note2, fatal = set(), "", False
-        batch = list(kept)
-        while batch:
-            chunk = batch[:MAX_PER_SCAN]
-            batch = batch[MAX_PER_SCAN:]
-            try:
-                transfer_share_files(share_id, passcode, chunk, target_fid, client,
-                                     keep_tree=keep_tree, share_name=link_name)
-                transferred |= set(f["fid"] for f in chunk if f.get("fid"))
-            except ShareError as e:
-                note2, fatal = e.message, e.fatal
-                break
-            except TokenExpired:
-                _mark_expired()
-                note2 = "登录已失效"
-                break
-            except ApiError as e:
-                note2, fatal = str(e), False
-                break
-            if batch:
-                time.sleep(2)
-        baseline_ids = transferred | set(f["fid"] for f in dropped if f.get("fid"))
+        try:
+            batch = list(kept)
+            while batch:
+                chunk = batch[:MAX_PER_SCAN]
+                batch = batch[MAX_PER_SCAN:]
+                try:
+                    transfer_share_files(share_id, passcode, chunk, target_fid, client,
+                                         keep_tree=keep_tree, share_name=link_name)
+                    # 成功一批就增量写回基线 —— 即便中断也只记真正成功的部分，
+                    # 没转成功的下轮扫描会自动补，不漏也不重。
+                    baseline_ids |= set(f["fid"] for f in chunk if f.get("fid"))
+                    monitor_store.update(mid, last_files=sorted(baseline_ids))
+                    transferred |= set(f["fid"] for f in chunk if f.get("fid"))
+                except ShareError as e:
+                    note2, fatal = e.message, e.fatal
+                    break
+                except TokenExpired:
+                    _mark_expired()
+                    note2 = "登录已失效"
+                    break
+                except ApiError as e:
+                    note2, fatal = str(e), False
+                    break
+                if batch:
+                    time.sleep(2)
+        finally:
+            if hold:
+                sch._busy.discard(mid)
+
         if note2:
             st = "invalid" if fatal else "error"
-            monitor_store.update(mid, last_files=sorted(baseline_ids),
-                                 link_name=link_name, last_scan=_now(), status=st,
+            monitor_store.update(mid, link_name=link_name, last_scan=_now(), status=st,
                                  last_result="已添加，转存中断（%s），已转 %d 个，下轮补"
                                              % (note2, len(transferred)))
             gygo_log.error("添加时转存中断", id=mid, err=note2,
                            transferred=len(transferred))
         else:
-            monitor_store.update(mid, last_files=sorted(baseline_ids),
-                                 link_name=link_name, last_scan=_now(), status="ok",
+            monitor_store.update(mid, link_name=link_name, last_scan=_now(), status="ok",
                                  last_result="已添加并转存 %d 个视频%s"
                                              % (len(transferred), note))
             gygo_log.info("新增监控并转存：%s", link_name or share_url,

@@ -255,6 +255,72 @@ finally:
     monitor._EXPIRED_GETTER = None
 
 print("\n" + "=" * 66)
+print("H. 修复：添加即转存期间不重复（基线先建 + _busy 互斥挡住抢跑扫描）")
+print("=" * 66)
+
+# 重置环境：复用假 list（60 集），用会"在转存时检查 _busy 并试探 scan_now"的假转存
+monitor._CLIENT_GETTER = lambda: FC
+monitor._EXPIRED_GETTER = lambda: False
+monitor._scheduler = _FakeSch()
+CALLS.clear()
+
+captured = []   # [占用期间的 mid, scan_now 返回值]
+_orig_tr = monitor.transfer_share_files
+def fake_transfer_check(sid, pwd, files, tgt, client, keep_tree=True, share_name=""):
+    busy = list(monitor._scheduler._busy)
+    if busy and not captured:
+        # 模拟"添加转存途中有人点了扫描 / 触发了即时扫描"
+        captured.append(busy[0])                    # 当前正被占用的监控项 id
+        captured.append(monitor.scan_now(busy[0]))  # 修复后应被挡，返回 False
+    for x in files:
+        CALLS.append(x["fid"])
+    return {"submitted": len(files), "ok": 1, "fail": 0, "timeout": 0, "detail": ["完成"]}
+monitor.transfer_share_files = fake_transfer_check
+try:
+    mh = monitor.add_and_baseline(
+        "https://www.guangyapan.com/s/1111111111111111_aBcDeFgHiJkLmNoP", "影视/H", 60,
+        client=FC)
+    check("添加即转存 60 集（3 批）", len(CALLS), 60)
+    check("60 个 fid 各只转一次（无副本）", len(set(CALLS)), 60)
+    check("建基线 60 条", len(mh["last_files"]), 60)
+    check("转存期间确实占用了 _busy", len(captured) >= 1, True)
+    if len(captured) >= 2:
+        check("占用期间 scan_now 被挡（不重复转存）", captured[1], False)
+        check("被挡的正是当前监控项", captured[0], mh["id"])
+finally:
+    monitor.transfer_share_files = _orig_tr
+    monitor._scheduler = None
+    monitor._CLIENT_GETTER = None
+    monitor._EXPIRED_GETTER = None
+
+print("\n" + "=" * 66)
+print("I. 手动扫描 act_scan 与定时扫描互斥（防并发重复）")
+print("=" * 66)
+import app as appmod
+appmod.CLIENT = FC
+appmod.AUTH_EXPIRED = False
+monitor._scheduler = _FakeSch()
+cnt = {"n": 0}
+_orig_so = monitor.scan_one
+def _count_scan(m, on_phase=None):
+    cnt["n"] += 1
+    return {"status": "ok", "added": 0, "total": 0}
+monitor.scan_one = _count_scan
+try:
+    mi = monitor.add_and_baseline(
+        "https://www.guangyapan.com/s/1111111111111111_aBcDeFgHiJkLmNoP", "影视/I", 60,
+        transfer_existing=False, client=FC)
+    # 模拟该链接正在被定时扫描占用
+    monitor._scheduler._busy.add(mi["id"])
+    r = appmod.act_scan(mi["id"])
+    check("扫描占用时手动扫描被拦截", r.get("ok"), False)
+    check("拦截时未运行 scan_one（无重复）", cnt["n"], 0)
+finally:
+    monitor._scheduler._busy.discard(mi["id"])
+    monitor.scan_one = _orig_so
+    monitor._scheduler = None
+
+print("\n" + "=" * 66)
 print("结果：通过 %d 项，失败 %d 项" % (PASS, FAIL))
 print("=" * 66)
 sys.exit(1 if FAIL else 0)

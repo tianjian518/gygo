@@ -21,7 +21,7 @@ from share_gy import ShareError
 
 PORT = int(os.environ.get("PORT") or os.environ.get("GYGO_PORT") or 5099)
 HERE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 
 # 全局状态
 CLIENT = None            # GuangyaClient 实例
@@ -211,8 +211,19 @@ def act_scan(mid):
     m = monitor_store.get(mid)
     if not m:
         raise ApiError("监控项不存在")
-    phases = []
-    result = monitor.scan_one(m, on_phase=lambda ph, kw: phases.append(ph))
+    # 与定时扫描 / 即时扫描互斥：同一链接只允许一个扫描在跑，
+    # 否则两个扫描都读到旧基线、都判"新增"，会把整批文件重复转存（20→40 副本）。
+    sch = monitor._scheduler
+    if sch is None or not sch.is_alive():
+        sch = monitor.start_scheduler()
+    if mid in sch._busy:
+        return {"ok": False, "msg": "该链接正在扫描中，请稍候再点"}
+    sch._busy.add(mid)
+    try:
+        phases = []
+        result = monitor.scan_one(m, on_phase=lambda ph, kw: phases.append(ph))
+    finally:
+        sch._busy.discard(mid)
     return {"ok": result.get("status") in ("ok",), "result": result,
             "phases": phases, "monitor": monitor_store.get(mid)}
 
