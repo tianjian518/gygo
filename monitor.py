@@ -241,8 +241,17 @@ def _apply_filters(files, monitor):
 
 def add_and_baseline(share_url, target_path, interval_min, pdir_fid="",
                      keep_tree=True, include_kw="", exclude_kw="",
-                     min_size_mb=0):
-    """新增监控项，并立刻拉一次链接建立基线（已存在的文件不会被转存）。"""
+                     min_size_mb=0, transfer_existing=True, client=None):
+    """新增监控项，并立刻拉一次链接。
+
+    transfer_existing=True（默认）且已登录时，会把分享里**当前已有的视频
+    也立刻转存**到目标目录（分批限流，避免一次灌爆），然后建立基线。
+    之后每次扫描只转"新出的"，这就是追剧逻辑。
+
+    其它情况退化为"只建基线"：
+      - 未登录（client=None）：基线留空，登录后首次扫描会自动转存全部
+      - 用户明确不要（transfer_existing=False）：建完整基线，只追新不重转
+    """
     share_id, passcode, parsed_pdir = parse_share_input(share_url)
     if not pdir_fid:
         pdir_fid = parsed_pdir
@@ -259,28 +268,89 @@ def add_and_baseline(share_url, target_path, interval_min, pdir_fid="",
         "exclude_kw": exclude_kw or "",
         "min_size_mb": int(min_size_mb or 0),
     })
+    mid = mon["id"]
 
-    # 建立基线：列一次分享，把当前所有文件记下来
+    # 列一次分享，建基线（列举是免登录接口）
     link_name = ""
     try:
         files, link_name = list_share_files(share_id, passcode, pdir_fid or "", only_video=True)
-        _kept, dropped = _apply_filters(files, mon)
+        kept, dropped = _apply_filters(files, mon)
         note = "（过滤掉 %d 个）" % len(dropped) if dropped else ""
-        monitor_store.update(mon["id"],
+    except ShareError as e:
+        monitor_store.update(mid, status="error" if not e.fatal else "invalid",
+                             last_result="建立基线失败：" + e.message)
+        return monitor_store.get(mid)
+    except Exception as e:
+        monitor_store.update(mid, status="error",
+                             last_result="建立基线失败：%s" % e)
+        return monitor_store.get(mid)
+
+    if transfer_existing and client is not None and not _expired():
+        # 立刻把当前已有的视频转存进来（分批 + 批间降速）
+        target_fid = None
+        try:
+            target_fid = client.resolve_path(target_path or "")
+        except (TokenExpired, ApiError) as e:
+            monitor_store.update(mid, status="error",
+                                 last_result="目标目录解析失败，仅建立基线（未转存）：%s" % e)
+            gygo_log.warn("添加时目标目录解析失败，仅建基线", id=mid)
+            return monitor_store.get(mid)
+
+        transferred, note2, fatal = set(), "", False
+        batch = list(kept)
+        while batch:
+            chunk = batch[:MAX_PER_SCAN]
+            batch = batch[MAX_PER_SCAN:]
+            try:
+                transfer_share_files(share_id, passcode, chunk, target_fid, client,
+                                     keep_tree=keep_tree, share_name=link_name)
+                transferred |= set(f["fid"] for f in chunk if f.get("fid"))
+            except ShareError as e:
+                note2, fatal = e.message, e.fatal
+                break
+            except TokenExpired:
+                _mark_expired()
+                note2 = "登录已失效"
+                break
+            except ApiError as e:
+                note2, fatal = str(e), False
+                break
+            if batch:
+                time.sleep(2)
+        baseline_ids = transferred | set(f["fid"] for f in dropped if f.get("fid"))
+        if note2:
+            st = "invalid" if fatal else "error"
+            monitor_store.update(mid, last_files=sorted(baseline_ids),
+                                 link_name=link_name, last_scan=_now(), status=st,
+                                 last_result="已添加，转存中断（%s），已转 %d 个，下轮补"
+                                             % (note2, len(transferred)))
+            gygo_log.error("添加时转存中断", id=mid, err=note2,
+                           transferred=len(transferred))
+        else:
+            monitor_store.update(mid, last_files=sorted(baseline_ids),
+                                 link_name=link_name, last_scan=_now(), status="ok",
+                                 last_result="已添加并转存 %d 个视频%s"
+                                             % (len(transferred), note))
+            gygo_log.info("新增监控并转存：%s", link_name or share_url,
+                          added=len(transferred), dropped=len(dropped),
+                          target=target_path or "(根目录)")
+    elif client is None:
+        # 未登录添加：基线留空，登录后首次扫描会当成"新出的"全部转存
+        monitor_store.update(mid, link_name=link_name, last_scan=_now(),
+                             status="pending",
+                             last_result="已添加，尚未登录，登录后首次扫描会自动转存全部视频%s"
+                                         % note)
+        gygo_log.info("新增监控（未登录，空基线）：%s", link_name or share_url)
+    else:
+        # 已登录但用户选了"只追新"：建完整基线，不转已有
+        monitor_store.update(mid,
                              last_files=[f["fid"] for f in files if f.get("fid")],
                              link_name=link_name, last_scan=_now(), status="ok",
-                             last_result="已添加，基线 %d 个视频%s（这些不会被转存）"
+                             last_result="已添加，基线 %d 个视频（按设置不转存已有，仅追更）%s"
                                          % (len(files), note))
-        gygo_log.info("新增监控：%s", link_name or share_url,
-                      baseline=len(files), dropped=len(dropped),
-                      target=target_path or "(根目录)")
-    except ShareError as e:
-        monitor_store.update(mon["id"], status="error" if not e.fatal else "invalid",
-                             last_result="建立基线失败：" + e.message)
-    except Exception as e:
-        monitor_store.update(mon["id"], status="error",
-                             last_result="建立基线失败：%s" % e)
-    return monitor_store.get(mon["id"])
+        gygo_log.info("新增监控（仅基线/追新）：%s", link_name or share_url,
+                      baseline=len(files))
+    return monitor_store.get(mid)
 
 
 class MonitorScheduler(threading.Thread):
@@ -295,6 +365,8 @@ class MonitorScheduler(threading.Thread):
             time.sleep(60)
             if _expired():
                 continue
+            if _client() is None:
+                continue            # 还没登录就先不扫，免得反复报"尚未登录"
             now = time.time()
             for m in monitor_store.list_all():
                 if not m.get("enabled"):

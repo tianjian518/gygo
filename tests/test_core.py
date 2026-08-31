@@ -142,12 +142,14 @@ monitor.transfer_share_files = fake_transfer
 
 monitor.bind(type("A", (), {"CLIENT": FC, "AUTH_EXPIRED": False}), lambda v: None)
 
-# 建基线：60 个全在基线，不转存
-mon = monitor.add_and_baseline("https://www.guangyapan.com/s/xxx_yyy", "影视/测试", 60)
-check("建基线条数", len(mon["last_files"]), 60)
-check("建基线不转存", len(CALLS), 0)
+# 添加即转存：已登录 + transfer_existing 默认 True，应把 60 集全部转存并建基线
+mon = monitor.add_and_baseline("https://www.guangyapan.com/s/xxx_yyy", "影视/测试", 60,
+                               client=FC)
+check("添加即转存 60 集（3 批）", len(CALLS), 3)
+check("建基线 60 条", len(mon["last_files"]), 60)
 
 # 清空基线 → 模拟"60 集全是新的"
+CALLS.clear()
 monitor_store.update(mon["id"], last_files=[])
 r1 = monitor.scan_one(monitor_store.get(mon["id"]))
 check("第一轮转存数", r1.get("added"), 20)
@@ -186,8 +188,8 @@ print("E. 被过滤的文件也会进基线（不会每轮重复判定）")
 print("=" * 66)
 monitor_store.remove(mon["id"])
 mon2 = monitor.add_and_baseline("https://www.guangyapan.com/s/xxx_yyy", "影视/测试", 60,
-                                include_kw="不存在的关键词")
-check("建基线全量 60", len(mon2["last_files"]), 60)
+                                include_kw="不存在的关键词", client=FC)
+check("被过滤的也进基线（全量 60）", len(mon2["last_files"]), 60)
 monitor_store.update(mon2["id"], last_files=[])
 CALLS.clear()
 r = monitor.scan_one(monitor_store.get(mon2["id"]))
@@ -196,6 +198,24 @@ check("过滤数 60", r.get("filtered"), 60)
 check("但基线已推进 60", len(monitor_store.get(mon2["id"])["last_files"]), 60)
 r = monitor.scan_one(monitor_store.get(mon2["id"]))
 check("下轮不再有新增", r.get("added"), 0)
+
+print("\n" + "=" * 66)
+print("F. 添加时不转存的两种情形")
+print("=" * 66)
+# 未登录添加：基线留空，登录后首次扫描会把全部当新增转存
+CALLS.clear()
+m_nologin = monitor.add_and_baseline(
+    "https://www.guangyapan.com/s/1111111111111111_aBcDeFgHiJkLmNoP", "影视/X", 60)
+check("未登录→空基线", len(m_nologin["last_files"]), 0)
+check("未登录→不转存", len(CALLS), 0)
+
+# 已登录但 transfer_existing=False：建完整基线，不转已有（只追新）
+CALLS.clear()
+m_trackonly = monitor.add_and_baseline(
+    "https://www.guangyapan.com/s/1111111111111111_aBcDeFgHiJkLmNoP", "影视/X", 60,
+    transfer_existing=False, client=FC)
+check("只追新→建基线 60 条", len(m_trackonly["last_files"]), 60)
+check("只追新→不转存", len(CALLS), 0)
 
 print("\n" + "=" * 66)
 print("结果：通过 %d 项，失败 %d 项" % (PASS, FAIL))

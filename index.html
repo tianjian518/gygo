@@ -120,6 +120,11 @@
   </div>
   <div class="hint">间隔最低 60 分钟。调太低会触发光鸭风控，得不偿失。</div>
 
+  <label class="check">
+    <input type="checkbox" id="transferExisting" checked>
+    添加时立即转存链接里已有的视频（取消勾选则只追新、不转已有的）
+  </label>
+
   <details>
     <summary>▸ 高级选项（过滤规则 / 目录结构）</summary>
     <div class="adv">
@@ -257,7 +262,8 @@ $('btnAdd').onclick = async () => {
       keep_tree: $('keepTree').checked,
       include_kw: $('includeKw').value.trim(),
       exclude_kw: $('excludeKw').value.trim(),
-      min_size_mb: parseInt($('minSize').value || '0', 10)})});
+      min_size_mb: parseInt($('minSize').value || '0', 10),
+      transfer_existing: $('transferExisting').checked})});
   $('btnAdd').disabled = false; $('btnAdd').textContent = '＋ 添加监控';
   show($('addMsg'), r.msg || (r.ok ? (r.monitor && r.monitor.last_result || '已添加') : '添加失败'), r.ok);
   if(r.ok){ $('shareUrl').value=''; refresh(); }

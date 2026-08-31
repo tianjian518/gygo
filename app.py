@@ -21,7 +21,7 @@ from share_gy import ShareError
 
 PORT = int(os.environ.get("PORT") or os.environ.get("GYGO_PORT") or 5099)
 HERE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "1.1.2"
+VERSION = "1.2.0"
 
 # 全局状态
 CLIENT = None            # GuangyaClient 实例
@@ -128,10 +128,14 @@ def _need_client():
 
 
 def act_add_monitor(share_url, target_path, interval_min, **opts):
-    _need_client()
     if not share_url:
         raise ApiError("请填写分享链接")
-    mon = monitor.add_and_baseline(share_url, target_path, interval_min, **opts)
+    # 未登录也能添加（先攒链接，登录后首次扫描会自动转存）。transfer_existing
+    # 默认 True：添加即把当前已有视频也转存进来；设为 False 则只追新不重转。
+    transfer_existing = bool(opts.pop("transfer_existing", True))
+    mon = monitor.add_and_baseline(
+        share_url, target_path, interval_min,
+        transfer_existing=transfer_existing, client=CLIENT, **opts)
     return {"ok": True, "monitor": mon}
 
 
@@ -317,6 +321,7 @@ class Handler(BaseHTTPRequestHandler):
                     include_kw=(data.get("include_kw") or "").strip(),
                     exclude_kw=(data.get("exclude_kw") or "").strip(),
                     min_size_mb=int(data.get("min_size_mb") or 0),
+                    transfer_existing=data.get("transfer_existing", True),
                 )
                 return self._send(200, r)
 
