@@ -4,7 +4,9 @@
 只有最后一步 restore_share 需要用户自己的登录态。
 
 两个易错点：
-  1. 分享列表 page 从 1 开始（个人盘从 0 开始）
+  1. 分享列表用「游标分页」：响应里带 cursor + hasMore，翻页要带 cursor
+     参数（光鸭会忽略 page 参数，硬传 page 会一直返回第一页 → 死循环）。
+     同时兼容不带 cursor/hasMore 的旧式页码分页。
   2. 根目录 parentId 两边都是空字符串 ""（传 "0" 会静默返回空，别踩）
 """
 
@@ -206,18 +208,28 @@ def list_share_files(share_id, passcode="", pdir_fid="", only_video=True):
 def _walk(token, parent_id, prefix, out, depth, only_video):
     if depth > MAX_DEPTH or len(out) > 10000:
         return
-    for page in range(1, MAX_PAGE + 1):
-        payload = _public_post("get_share_page_files_list", {
+    cursor = None          # 游标分页：下一页的 cursor
+    page = 1               # 旧式页码分页：页码
+    use_cursor = None      # None=待定, True=游标分页, False=页码分页
+    pages = 0
+    while pages < MAX_PAGE:
+        pages += 1
+        body = {
             "accessToken": token,
             "parentId": parent_id,
-            "page": page,
             "pageSize": PAGE_SIZE,
             "orderBy": 0,
             "sortType": 0,
-        })
+        }
+        if use_cursor:
+            body["cursor"] = cursor
+        else:
+            body["page"] = page
+        payload = _public_post("get_share_page_files_list", body)
         if _is_fail(payload):
             # 链接中途失效：往上抛，让监控标记为 invalid
             raise ShareError(_msg(payload, "列举分享目录失败"), fatal=True)
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
         items = _extract_list(payload)
         if not items:
             return
@@ -227,8 +239,21 @@ def _walk(token, parent_id, prefix, out, depth, only_video):
                 _walk(token, item["fid"], item["path"], out, depth + 1, only_video)
             elif (not only_video) or item["is_video"]:
                 out.append(item)
-        if len(items) < PAGE_SIZE:
-            return
+        # 首次响应判定分页模式：光鸭用 cursor + hasMore 翻页（忽略 page 参数），
+        # 旧接口可能仍用页码。两种都要兼容，否则大文件夹会卡在首页死循环。
+        if use_cursor is None:
+            use_cursor = bool("cursor" in data or "hasMore" in data)
+        if use_cursor:
+            raw_has = data.get("hasMore")
+            has_more = raw_has in (True, "true", "True", 1, "1")
+            nxt = data.get("cursor")
+            if not has_more or not nxt:
+                return
+            cursor = nxt
+        else:
+            if len(items) < PAGE_SIZE:
+                return
+            page += 1
 
 
 def _norm_share_item(it, prefix):

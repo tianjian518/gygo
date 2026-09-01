@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import monitor
 import monitor_store
+import share_gy
 from share_gy import _rel_dir_of
 from guangya import normalize_phone
 
@@ -332,6 +333,74 @@ finally:
     monitor._scheduler._busy.discard(mi["id"])
     monitor.scan_one = _orig_so
     monitor._scheduler = None
+
+print("\n" + "=" * 66)
+print("J. 分享列举分页：游标分页修复（修复 178 集被重复列举成 10000）")
+print("=" * 66)
+# 模拟「根目录 1 个文件夹 + 文件夹内 178 个文件」的分享，
+# 且光鸭接口用 cursor/hasMore 分页（忽略 page 参数，硬传 page 会死循环成 10000）。
+FOLDER_FID = "folder001"
+def _fake_pp_cursor(path, body):
+    if path == "get_share_summary":
+        return {"msg": "success", "data": {"title": "遮天 (2023)",
+                "shareId": "s1_a", "shareStatus": 1}}
+    if path == "get_share_access_token":
+        return {"access_token": "tok", "shareName": "遮天 (2023)"}
+    if path == "get_share_page_files_list":
+        pid = body.get("parentId", "")
+        if pid == "":
+            return {"data": {"total": 1, "list": [
+                {"fileId": FOLDER_FID, "fileName": "遮天 (2023)",
+                 "resType": 2, "dirType": 1}], "hasMore": False}}
+        cursor = body.get("cursor")
+        order = ["S01E%03d.mkv" % i for i in range(1, 179)]
+        start = int(cursor) if cursor else 0
+        chunk = order[start:start + 50]
+        nxt = start + 50
+        has_more = nxt < len(order)
+        return {"data": {"total": 178, "list": [
+                    {"fileId": "f%d" % (start + i), "fileName": n, "resType": 1}
+                    for i, n in enumerate(chunk)],
+                "hasMore": has_more, "cursor": str(nxt) if has_more else ""}}
+    return {"data": {}}
+
+_orig_pp = share_gy._public_post
+share_gy._public_post = _fake_pp_cursor
+try:
+    files, name = share_gy.list_share_files("s1_a", "", "", only_video=True)
+    check("游标分页列举总数=178", len(files), 178)
+    check("无重复（去重数=178）", len(set(f["name"] for f in files)), 178)
+    check("首集 S01E001", files[0]["name"], "S01E001.mkv")
+    check("末集 S01E178", files[-1]["name"], "S01E178.mkv")
+finally:
+    share_gy._public_post = _orig_pp
+
+print("\n" + "=" * 66)
+print("K. 兼容旧式页码分页（响应无 cursor/hasMore 字段）")
+print("=" * 66)
+def _fake_pp_page(path, body):
+    if path == "get_share_summary":
+        return {"msg": "success", "data": {"title": "测试剧", "shareId": "s2", "shareStatus": 1}}
+    if path == "get_share_access_token":
+        return {"access_token": "tok", "shareName": "测试剧"}
+    if path == "get_share_page_files_list":
+        pg = body.get("page", 1)
+        order = ["E%02d.mkv" % i for i in range(1, 81)]   # 80 个，分两页
+        start = (pg - 1) * 50
+        chunk = order[start:start + 50]
+        return {"data": {"total": 80, "list": [
+                    {"fileId": "x%d" % (start + i), "fileName": n, "resType": 1}
+                    for i, n in enumerate(chunk)]}}
+    return {"data": {}}
+
+_orig_pp2 = share_gy._public_post
+share_gy._public_post = _fake_pp_page
+try:
+    files2, _ = share_gy.list_share_files("s2", "", "", only_video=True)
+    check("页码分页列举总数=80", len(files2), 80)
+    check("页码分页无重复", len(set(f["name"] for f in files2)), 80)
+finally:
+    share_gy._public_post = _orig_pp2
 
 print("\n" + "=" * 66)
 print("结果：通过 %d 项，失败 %d 项" % (PASS, FAIL))
