@@ -23,9 +23,13 @@ from guangya import ApiError, TokenExpired
 from share_gy import (ShareError, list_share_files, parse_share_input,
                       transfer_share_files)
 
-# 单轮最多转存多少个文件。分享方一次性补更几十集时，分批慢慢转，
-# 一口气全塞进去容易触发光鸭风控，也容易把免费号的每日额度打满。
+# 添加即转存 / 全量回填时，单次接口批量大小（安全值，防一次性请求过大）。
 MAX_PER_SCAN = 20
+# 追更模式：单次扫描最多转存多少个。分享方一次性补更几十集时，分批慢慢转，
+# 一口气全塞进去容易触发光鸭风控，也容易把免费号的每日额度打满。
+# 注意：仅"追更"（基线已有内容）时生效；首次全量回填（基线为空）不设上限，
+# 一次性把整部剧/整部动漫全部转存完，避免一两百集按小时一轮轮补。
+MAX_PER_ROUND = 20
 
 # 与 app.py 解耦：启动时由 app 把自己的模块绑进来，避免循环 import
 _CLIENT_GETTER = None
@@ -115,14 +119,18 @@ def scan_one(monitor, on_phase=None):
         gygo_log.info("过滤掉 %d 个文件", len(filtered),
                       monitor=monitor.get("link_name"))
 
-    # 3.6) 限流：一轮最多转 MAX_PER_SCAN 个，剩下的留到下一轮
+    # 3.6) 限流：仅"追更"模式（基线已有内容）下，一轮最多转 MAX_PER_ROUND 个，
+    #      超出的留到下一轮慢慢补，避免一次灌爆风控 / 打满每日额度。
+    #      若是"首次全量回填"（基线为空 prev 为空集），则不设上限，
+    #      一次性把整部剧 / 整部动漫的全部集数转存完，不再按小时一轮轮补。
     pending = 0
-    if len(new_files) > MAX_PER_SCAN:
-        pending = len(new_files) - MAX_PER_SCAN
-        gygo_log.warn("单次新增 %d 个，超过上限 %d，本轮只转前 %d 个",
-                      len(new_files), MAX_PER_SCAN, MAX_PER_SCAN,
+    is_backfill = len(prev) == 0
+    if not is_backfill and len(new_files) > MAX_PER_ROUND:
+        pending = len(new_files) - MAX_PER_ROUND
+        gygo_log.warn("单次新增 %d 个，超过追更上限 %d，本轮只转前 %d 个（剩余 %d 下轮补）",
+                      len(new_files), MAX_PER_ROUND, MAX_PER_ROUND, pending,
                       monitor=monitor.get("link_name"))
-        new_files = new_files[:MAX_PER_SCAN]
+        new_files = new_files[:MAX_PER_ROUND]
 
     added = 0
     transfer = {"submitted": 0, "ok": 0, "fail": 0, "timeout": 0, "detail": []}

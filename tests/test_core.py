@@ -149,40 +149,53 @@ mon = monitor.add_and_baseline("https://www.guangyapan.com/s/xxx_yyy", "影视/�
 check("添加即转存 60 集（3 批）", len(CALLS), 3)
 check("建基线 60 条", len(mon["last_files"]), 60)
 
-# 清空基线 → 模拟"60 集全是新的"
+# 追更模式：基线已有内容（fid99 是之前已转的旧集），分享里又冒出 60 集新文件。
+# 此时应受 20/轮 限速，一轮一轮补，而不是一次灌 60 个触发风控 / 打满额度。
 CALLS.clear()
-monitor_store.update(mon["id"], last_files=[])
+monitor_store.update(mon["id"], last_files=["fid99"])
 r1 = monitor.scan_one(monitor_store.get(mon["id"]))
-check("第一轮转存数", r1.get("added"), 20)
-check("第一轮剩余排队", r1.get("pending"), 40)
+check("追更第一轮转存数", r1.get("added"), 20)
+check("追更第一轮剩余排队", r1.get("pending"), 40)
 m1 = monitor_store.get(mon["id"])
-check("基线只推进 20", len(m1["last_files"]), 20)
+check("追更基线只推进 20（共 21）", len(m1["last_files"]), 21)
 
 r2 = monitor.scan_one(monitor_store.get(mon["id"]))
-check("第二轮转存数", r2.get("added"), 20)
-check("第二轮剩余排队", r2.get("pending"), 20)
+check("追更第二轮转存数", r2.get("added"), 20)
+check("追更第二轮剩余排队", r2.get("pending"), 20)
 
 r3 = monitor.scan_one(monitor_store.get(mon["id"]))
-check("第三轮转存数", r3.get("added"), 20)
-check("第三轮剩余排队", r3.get("pending"), 0)
+check("追更第三轮转存数", r3.get("added"), 20)
+check("追更第三轮剩余排队", r3.get("pending"), 0)
 
 r4 = monitor.scan_one(monitor_store.get(mon["id"]))
-check("第四轮无新增", r4.get("added"), 0)
-check("累计转存 60 集", sum(len(c) for c in CALLS), 60)
+check("追更第四轮无新增", r4.get("added"), 0)
+check("追更累计转存 60 集", sum(len(c) for c in CALLS), 60)
 
 print("\n" + "=" * 66)
-print("D. 转存失败：基线不推进，下轮重试")
+print("C2. 首次全量回填：基线为空 → 一次性全转 60 集（不受 20/轮 限制）")
 print("=" * 66)
 monitor_store.update(mon["id"], last_files=[])
+CALLS.clear()
+rb = monitor.scan_one(monitor_store.get(mon["id"]))
+check("回填一次性转存 60", rb.get("added"), 60)
+check("回填无剩余排队", rb.get("pending"), 0)
+check("回填后基线 60", len(monitor_store.get(mon["id"])["last_files"]), 60)
+rbb = monitor.scan_one(monitor_store.get(mon["id"]))
+check("回填后再扫无新增", rbb.get("added"), 0)
+
+print("\n" + "=" * 66)
+print("D. 转存失败：基线不推进，下轮重试（回填场景一次性全转）")
+print("=" * 66)
+monitor_store.update(mon["id"], last_files=[])   # 首次回填场景：基线空
 CALLS.clear()
 FC.fail_next = True
 r = monitor.scan_one(monitor_store.get(mon["id"]))
 check("失败时状态", r.get("status"), "error")
-check("失败后基线为空", len(monitor_store.get(mon["id"])["last_files"]), 0)
+check("失败后基线仍为空", len(monitor_store.get(mon["id"])["last_files"]), 0)
 
 r = monitor.scan_one(monitor_store.get(mon["id"]))
-check("下轮自动重试并成功", r.get("added"), 20)
-check("重试后基线推进", len(monitor_store.get(mon["id"])["last_files"]), 20)
+check("下轮自动重试并一次性全转 60", r.get("added"), 60)
+check("重试后基线推进 60", len(monitor_store.get(mon["id"])["last_files"]), 60)
 
 print("\n" + "=" * 66)
 print("E. 被过滤的文件也会进基线（不会每轮重复判定）")

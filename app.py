@@ -21,7 +21,7 @@ from share_gy import ShareError
 
 PORT = int(os.environ.get("PORT") or os.environ.get("GYGO_PORT") or 5099)
 HERE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "1.2.2"
+VERSION = "1.3.0"
 
 # 全局状态
 CLIENT = None            # GuangyaClient 实例
