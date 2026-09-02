@@ -17,11 +17,11 @@ import gygo_log
 import monitor
 import monitor_store
 from guangya import ApiError, GuangyaClient, TokenExpired, ROOT_FID
-from share_gy import ShareError
+from share_gy import ShareError, parse_share_input
 
 PORT = int(os.environ.get("PORT") or os.environ.get("GYGO_PORT") or 5099)
 HERE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 
 # 全局状态
 CLIENT = None            # GuangyaClient 实例
@@ -139,6 +139,24 @@ def act_add_monitor(share_url, target_path, interval_min, **opts):
     # 未登录也能添加（先攒链接，登录后首次扫描会自动转存）。transfer_existing
     # 默认 True：添加即把当前已有视频也转存进来；设为 False 则只追新不重转。
     transfer_existing = bool(opts.pop("transfer_existing", True))
+
+    # 重复链接防护：同一个分享链接只允许存在一个监控项。
+    # 以前不查重：同一链接加几次就建几个监控项，而每个监控项在
+    # 「添加即转存」或「登录后首次回填」时都会各自全量转存一遍 —— 实测
+    # 遮天 178 集被建成 5 个监控项，盘里就成了每集 5 个一模一样的副本。
+    try:
+        _sid, _pc, _pdir = parse_share_input(share_url)
+    except Exception:
+        _sid = ""
+    if _sid:
+        for _m in monitor_store.list_all():
+            if _m.get("share_id") == _sid and _m.get("status") != "invalid":
+                gygo_log.info("重复添加已拦截", monitor=_m.get("id"),
+                              name=_m.get("link_name"))
+                return {"ok": True, "duplicate": True,
+                        "msg": "该链接已在监控中（#%s %s），不会重复添加、也不会重复转存"
+                               % (_m.get("id"), _m.get("link_name") or ""),
+                        "monitor": _m}
     mon = monitor.add_and_baseline(
         share_url, target_path, interval_min,
         transfer_existing=transfer_existing, client=CLIENT, **opts)
@@ -226,6 +244,103 @@ def act_scan(mid):
         sch._busy.discard(mid)
     return {"ok": result.get("status") in ("ok",), "result": result,
             "phases": phases, "monitor": monitor_store.get(mid)}
+
+
+def act_cleanup_duplicates():
+    """清理重复的监控项：同一个 share_id 只保留最早（id 最小）的那个。
+
+    场景：同一个分享链接被加了多次，于是建了多个监控项，而每个监控项在
+    「添加即转存」或「登录后首次回填」时都会各自全量转存一遍 —— 实测
+    遮天 178 集被建成 5 个监控项，盘里就成了每集 5 个一模一样的副本。
+
+    注意：只删 gygo 的监控配置，**不会删你盘里已经转存的文件**。
+    """
+    groups = {}
+    for m in monitor_store.list_all():
+        sid = m.get("share_id")
+        if not sid:
+            continue
+        groups.setdefault(sid, []).append(m)
+    removed = []
+    for _sid, group in groups.items():
+        if len(group) <= 1:
+            continue
+        group.sort(key=lambda x: x.get("id") or 0)
+        for extra in group[1:]:
+            monitor_store.remove(extra["id"])
+            removed.append({"id": extra["id"],
+                            "name": extra.get("link_name") or ""})
+    if removed:
+        gygo_log.info("清理重复监控项", removed=len(removed))
+    return {"ok": True, "removed": len(removed), "removed_items": removed,
+            "msg": ("已清理 %d 个重复监控项（盘里已转存的文件不受影响）" % len(removed))
+                   if removed else "没有发现重复的监控项"}
+
+
+def _walk_my_dir(client, fid, prefix, out, depth=0):
+    """递归列举个人盘某个目录下的所有文件，结果追加进 out。"""
+    if depth > 10:
+        return
+    for it in client.list_dir(fid):
+        path = (prefix + "/" + it["name"]) if prefix else it["name"]
+        if it.get("dir"):
+            _walk_my_dir(client, it["fid"], path, out, depth + 1)
+        else:
+            out.append({"fid": it["fid"], "name": it["name"],
+                        "dir_path": prefix, "path": path,
+                        "size": it.get("size") or 0})
+
+
+def act_dedupe(mid, data=None):
+    """清理某个监控项目标目录下「同名重复」的文件副本。
+
+    场景：同一链接被建了多个监控项，每个都全量转存一遍，于是盘里每集
+    都有好几个一模一样的副本（实测遮天每集 5 个）。
+
+    规则（保守，只删确定是副本的）：
+      - 只统计**文件**，不动目录
+      - 按「所在目录 + 文件名」分组，同组超过 1 个才算重复
+      - 每组保留列表里的第一份，其余列入删除（副本内容一样，留哪份都一样）
+
+    data 里 dry_run=1（默认）只出报告不删除；确认无误后传 dry_run=0 才真删。
+    """
+    m = monitor_store.get(mid)
+    if not m:
+        raise ApiError("监控项不存在")
+    client = _need_client()
+    dry = bool((data or {}).get("dry_run", 1))
+
+    target_fid = monitor.resolve_target_fid(m, client)
+    files = []
+    _walk_my_dir(client, target_fid, m.get("target_path") or "", files)
+
+    groups = {}
+    for f in files:
+        groups.setdefault((f["dir_path"], f["name"]), []).append(f)
+    dup = {k: v for k, v in groups.items() if len(v) > 1}
+    to_delete = []
+    for _k, group in dup.items():
+        to_delete.extend(group[1:])
+
+    if not to_delete:
+        return {"ok": True, "dry_run": dry, "scanned": len(files),
+                "dup_groups": 0, "to_delete": 0, "deleted": 0,
+                "msg": "目标目录下没有发现同名重复文件"}
+
+    if dry:
+        return {"ok": True, "dry_run": True, "scanned": len(files),
+                "dup_groups": len(dup), "to_delete": len(to_delete), "deleted": 0,
+                "samples": [f["path"] for f in to_delete[:20]],
+                "msg": "预演：发现 %d 组同名重复、共 %d 个副本待删（本次未删除，"
+                       "确认后传 dry_run=0 执行）" % (len(dup), len(to_delete))}
+
+    fids = [f["fid"] for f in to_delete]
+    client.delete_files(fids)
+    gygo_log.info("清理同名副本", monitor=mid, deleted=len(fids))
+    return {"ok": True, "dry_run": False, "scanned": len(files),
+            "dup_groups": len(dup), "to_delete": len(to_delete),
+            "deleted": len(fids),
+            "msg": "已删除 %d 个同名副本，每组保留 1 份" % len(fids)}
 
 
 # ------------------------------------------------------------------ HTTP
@@ -345,6 +460,10 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return self._send(200, r)
 
+            # 清理重复监控项（同一链接只留一个，不删盘文件）
+            if path == "/api/monitors/cleanup":
+                return self._send(200, act_cleanup_duplicates())
+
             if path.startswith("/api/monitors/") and path.endswith("/scan"):
                 mid = int(path.split("/")[3])
                 return self._send(200, act_scan(mid))
@@ -360,6 +479,11 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(404, {"ok": False, "msg": "监控项不存在"})
                 monitor_store.update(mid, enabled=not m.get("enabled", True))
                 return self._send(200, {"ok": True, "monitor": monitor_store.get(mid)})
+
+            # 清理目标目录下的同名副本：/api/monitors/{id}/dedupe
+            if path.startswith("/api/monitors/") and path.endswith("/dedupe"):
+                mid = int(path.split("/")[3])
+                return self._send(200, act_dedupe(mid, data))
 
             # 编辑监控项：/api/monitors/{id}（只认三段，多的当未知路由）
             if path.startswith("/api/monitors/"):

@@ -117,6 +117,9 @@ class FakeClient(object):
     def resolve_path(self, path, root_fid=""):
         return "fid_root"
 
+    def dir_exists(self, fid):
+        return True
+
     def list_dir(self, fid, **kw):
         return []
 
@@ -130,7 +133,7 @@ def fake_list(sid, pwd, pdir, only_video=True):
              "path": "剧/S01E%02d.mp4" % i, "size": 100} for i in range(1, 61)], "测试剧"
 
 
-def fake_transfer(sid, pwd, files, tgt, client, keep_tree=True, share_name=""):
+def fake_transfer(sid, pwd, files, tgt, client, keep_tree=True, share_name="", dir_cache=None):
     CALLS.append([x["name"] for x in files])
     if FC.fail_next:
         FC.fail_next = False
@@ -280,7 +283,7 @@ CALLS.clear()
 
 captured = []   # [占用期间的 mid, scan_now 返回值]
 _orig_tr = monitor.transfer_share_files
-def fake_transfer_check(sid, pwd, files, tgt, client, keep_tree=True, share_name=""):
+def fake_transfer_check(sid, pwd, files, tgt, client, keep_tree=True, share_name="", dir_cache=None):
     busy = list(monitor._scheduler._busy)
     if busy and not captured:
         # 模拟"添加转存途中有人点了扫描 / 触发了即时扫描"
@@ -401,6 +404,105 @@ try:
     check("页码分页无重复", len(set(f["name"] for f in files2)), 80)
 finally:
     share_gy._public_post = _orig_pp2
+
+print("\n" + "=" * 66)
+print("L. 重复链接防护：同一链接只允许一个监控项（修复每集 5 副本）")
+print("=" * 66)
+# 预置一个已存在的同名监控项，再加同样的链接应被拦截
+monitor_store.add({"share_id": "s_dup_test", "link_name": "遮天 (2023)"})
+_orig_psi = appmod.parse_share_input
+appmod.parse_share_input = lambda u: ("s_dup_test", "", "")
+_called = {"n": 0}
+_orig_add = monitor.add_and_baseline
+def _fake_add(*a, **k):
+    _called["n"] += 1
+    return {"id": 999}
+monitor.add_and_baseline = _fake_add
+appmod.CLIENT = None
+appmod.AUTH_EXPIRED = False
+try:
+    r = appmod.act_add_monitor("https://www.guangyapan.com/s/s_dup_test_abc", "影视/Z", 60)
+    check("重复链接直接拦截(duplicate=True)", r.get("duplicate"), True)
+    check("重复链接不触发 add_and_baseline(不重复转存)", _called["n"], 0)
+    # 不同链接可以正常添加
+    appmod.parse_share_input = lambda u: ("s_other_xyz", "", "")
+    r2 = appmod.act_add_monitor("https://www.guangyapan.com/s/s_other_xyz_def", "影视/Q", 60)
+    check("不同链接可正常添加(触发一次)", _called["n"], 1)
+finally:
+    appmod.parse_share_input = _orig_psi
+    monitor.add_and_baseline = _orig_add
+
+print("\n" + "=" * 66)
+print("M. 改名安全：记住目录 fid，改名后新集仍转进同一目录（不再分裂）")
+print("=" * 66)
+class _MockDirClient:
+    def __init__(self):
+        self.resolve_calls = 0
+    def dir_exists(self, fid):
+        return fid == "cached_fid"
+    def resolve_path(self, path, root_fid=None):
+        self.resolve_calls += 1
+        return "new_fid"
+mm1 = monitor_store.add({"share_id": "s_m1", "target_path": "影视/动漫",
+                          "target_fid": "cached_fid", "target_fid_path": "影视/动漫"})
+mm2 = monitor_store.add({"share_id": "s_m2", "target_path": "影视/我的动漫",
+                          "target_fid": "cached_fid", "target_fid_path": "影视/动漫"})
+mc = _MockDirClient()
+fid1 = monitor.resolve_target_fid(mm1, mc)
+check("缓存 fid 命中时直接返回", fid1, "cached_fid")
+check("命中缓存不重新 resolve_path", mc.resolve_calls, 0)
+fid2 = monitor.resolve_target_fid(mm2, mc)
+check("路径变了重新 resolve", fid2, "new_fid")
+check("重新解析调用了 resolve_path", mc.resolve_calls, 1)
+check("新 fid 已写回缓存", monitor_store.get(mm2["id"]).get("target_fid"), "new_fid")
+
+print("\n" + "=" * 66)
+print("N. 清理重复监控项：同 share_id 只留最早一个")
+print("=" * 66)
+# 先把前面测试遗留的监控项清掉，避免干扰本组计数
+for _m in list(monitor_store.list_all()):
+    monitor_store.remove(_m["id"])
+_ids = [monitor_store.add({"share_id": "s_same", "link_name": "X"})["id"] for _ in range(3)]
+resN = appmod.act_cleanup_duplicates()
+check("清理掉多余 2 个", resN["removed"], 2)
+check("只保留 id 最小的", monitor_store.get(_ids[0]) is not None, True)
+check("其余 2 个被删除", monitor_store.get(_ids[1]) is None
+      and monitor_store.get(_ids[2]) is None, True)
+
+print("\n" + "=" * 66)
+print("O. 盘内同名副本去重：同目录同名只留一份（清掉每集 5 副本）")
+print("=" * 66)
+class _MockFileClient:
+    def __init__(self, files):
+        self._files = files
+        self.deleted = []
+    def list_dir(self, fid, page_size=100, max_pages=200):
+        return self._files
+    def delete_files(self, fids):
+        self.deleted = list(fids)
+    def dir_exists(self, fid):
+        return True
+    def resolve_path(self, path, root_fid=None):
+        return "tgt"
+_ofiles = [
+    {"fid": "a1", "name": "A.mp4", "dir": False, "size": 100},
+    {"fid": "a2", "name": "A.mp4", "dir": False, "size": 100},
+    {"fid": "a3", "name": "A.mp4", "dir": False, "size": 100},
+    {"fid": "b1", "name": "B.mp4", "dir": False, "size": 100},
+]
+mc2 = _MockFileClient(_ofiles)
+appmod.CLIENT = mc2
+appmod.AUTH_EXPIRED = False
+mo = monitor_store.add({"share_id": "s_o", "target_path": "影视/D",
+                        "target_fid": "tgt", "target_fid_path": "影视/D"})
+resO = appmod.act_dedupe(mo["id"], {"dry_run": 1})
+check("预演发现 1 组重复", resO["dup_groups"], 1)
+check("预演待删 2 个副本", resO["to_delete"], 2)
+check("预演不真删", len(mc2.deleted), 0)
+resO2 = appmod.act_dedupe(mo["id"], {"dry_run": 0})
+check("执行删除 2 个副本", resO2["deleted"], 2)
+check("每组保留 1 份(删 2 留 1)", len(mc2.deleted), 2)
+appmod.CLIENT = None
 
 print("\n" + "=" * 66)
 print("结果：通过 %d 项，失败 %d 项" % (PASS, FAIL))

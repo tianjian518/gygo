@@ -411,6 +411,20 @@ class GuangyaClient(object):
             fid = self.find_or_create_dir(part.strip(), fid)
         return fid
 
+    def dir_exists(self, fid):
+        """目录 fid 是否仍然有效。
+
+        **改名不会改变光鸭的目录 fid**，只有被删除或无权访问才会失效。
+        gygo 靠它"记住"目录：你在光鸭里把文件夹改名后，fid 照样有效，
+        新集数仍然转进改名后的同一个目录，不会因为"按名字找不到"
+        而新建一个原来名字的目录、把一部剧拆成两个文件夹。
+        """
+        try:
+            self.list_dir(fid, page_size=1, max_pages=1)
+            return True
+        except Exception:
+            return False
+
 
 # ------------------------------------------------------------------ 工具函数
 

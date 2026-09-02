@@ -326,7 +326,7 @@ def _rel_dir_of(item, share_name, keep_tree):
 
 
 def transfer_share_files(share_id, passcode, files, target_fid, client,
-                         keep_tree=True, share_name=""):
+                         keep_tree=True, share_name="", dir_cache=None):
     """把分享里的指定文件转存到自己的 target_fid 目录。
 
     client 必须已登录：restore_share 的请求头要用户 Bearer token，
@@ -334,6 +334,11 @@ def transfer_share_files(share_id, passcode, files, target_fid, client,
 
     keep_tree=True 时，分享里的子目录结构会照搬到目标目录下
     （多季剧不会全平铺在一起）。
+
+    dir_cache 是「相对目录 -> 已解析好的 fid」字典，由调用方持久化。
+    光鸭的目录 fid 改名后不变，所以记住它以后，你在光鸭里把子目录改名了，
+    新集数仍然转进改名后的同一个目录，不会因为"按名字找不到"而新建一个
+    原名目录、把一部剧拆成两份。传 None 表示不启用（退化成按名字解析）。
 
     返回 dict：
       submitted 提交转存的文件数
@@ -364,12 +369,23 @@ def transfer_share_files(share_id, passcode, files, target_fid, client,
 
     for rel in order:
         group = buckets[rel]
-        try:
-            dest_fid = client.resolve_path(rel, root_fid=target_fid) if rel else target_fid
-        except Exception as e:
-            result["fail"] += 1
-            result["detail"].append("[%s] 目录创建失败：%s" % (rel or "/", e))
-            continue
+        dest_fid = target_fid
+        if rel:
+            dest_fid = None
+            # 优先用记住的 fid：改名后 fid 依然有效，直接转进改名后的那个目录
+            if dir_cache is not None:
+                cached = dir_cache.get(rel)
+                if cached and client.dir_exists(cached):
+                    dest_fid = cached
+            if not dest_fid:
+                try:
+                    dest_fid = client.resolve_path(rel, root_fid=target_fid)
+                except Exception as e:
+                    result["fail"] += 1
+                    result["detail"].append("[%s] 目录创建失败：%s" % (rel or "/", e))
+                    continue
+                if dir_cache is not None:
+                    dir_cache[rel] = dest_fid
 
         fids = [x["fid"] for x in group]
         for i in range(0, len(fids), BATCH_SIZE):

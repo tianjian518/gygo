@@ -64,6 +64,29 @@ def _now():
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def resolve_target_fid(m, client):
+    """解析监控项的目标目录 fid（改名安全）。
+
+    以前每轮都按"名字"解析：resolve_path 是按名字找目录、找不到就自动新建。
+    于是你在光鸭里把文件夹改名后，gygo 找不到原名，就会**新建一个原来名字
+    的目录**，新集数进新目录、旧集留在改名后的目录 —— 一部剧被拆成两份。
+
+    光鸭的目录 fid 在改名后是不变的，所以这里记住 fid：
+      1. 缓存里有 fid、且它是为当前 target_path 解析的、且目录还在 → 直接用
+      2. 否则按路径解析（找不到会自动建目录），并把 fid 记进缓存
+    目录被删导致 fid 失效时，自动回退成按名字重建，不会卡死。
+    """
+    mid = m.get("id")
+    path = m.get("target_path") or ""
+    cached = m.get("target_fid")
+    if cached and m.get("target_fid_path") == path and client.dir_exists(cached):
+        return cached
+    fid = client.resolve_path(path)
+    if mid and fid != cached:
+        monitor_store.update(mid, target_fid=fid, target_fid_path=path)
+    return fid
+
+
 def scan_one(monitor, on_phase=None):
     """扫描单个监控项一次。"""
     def _phase(ph, **kw):
@@ -81,10 +104,10 @@ def scan_one(monitor, on_phase=None):
         monitor_store.update(mid, status="paused")
         return {"status": "paused", "msg": "登录已失效，暂停监控"}
 
-    # 1) 解析目标目录（没有就沿途创建）
+    # 1) 解析目标目录（没有就沿途创建；改名后靠缓存的 fid 找回同一个目录）
     _phase("解析目标目录")
     try:
-        target_fid = client.resolve_path(monitor.get("target_path") or "")
+        target_fid = resolve_target_fid(monitor, client)
     except TokenExpired:
         _mark_expired()
         monitor_store.update(mid, status="paused")
@@ -140,12 +163,17 @@ def scan_one(monitor, on_phase=None):
             monitor_store.update(mid, status="paused")
             return {"status": "paused", "msg": "登录已失效，暂停监控"}
         try:
+            _dir_cache = dict(monitor.get("dir_fids") or {})
             transfer = transfer_share_files(
                 monitor["share_id"], monitor.get("passcode") or "",
                 new_files, target_fid, client,
                 keep_tree=monitor.get("keep_tree", True),
-                share_name=monitor.get("link_name") or "")
+                share_name=monitor.get("link_name") or "",
+                dir_cache=_dir_cache)
             added = transfer.get("submitted", 0)
+            # 记住子目录 fid（改名安全）：下次仍转进同一个目录，不新建原名目录
+            if _dir_cache != (monitor.get("dir_fids") or {}):
+                monitor_store.update(mid, dir_fids=_dir_cache)
         except ShareError as e:
             if e.fatal:
                 monitor_store.update(mid, status="invalid",
@@ -297,7 +325,7 @@ def add_and_baseline(share_url, target_path, interval_min, pdir_fid="",
         # 立刻把当前已有的视频转存进来（分批 + 批间降速）
         target_fid = None
         try:
-            target_fid = client.resolve_path(target_path or "")
+            target_fid = resolve_target_fid(mon, client)
         except (TokenExpired, ApiError) as e:
             monitor_store.update(mid, status="error",
                                  last_result="目标目录解析失败，仅建立基线（未转存）：%s" % e)
@@ -324,6 +352,7 @@ def add_and_baseline(share_url, target_path, interval_min, pdir_fid="",
             sch._busy.add(mid)
 
         transferred, note2, fatal = set(), "", False
+        dir_cache = {}
         try:
             batch = list(kept)
             while batch:
@@ -331,7 +360,8 @@ def add_and_baseline(share_url, target_path, interval_min, pdir_fid="",
                 batch = batch[MAX_PER_SCAN:]
                 try:
                     transfer_share_files(share_id, passcode, chunk, target_fid, client,
-                                         keep_tree=keep_tree, share_name=link_name)
+                                         keep_tree=keep_tree, share_name=link_name,
+                                         dir_cache=dir_cache)
                     # 成功一批就增量写回基线 —— 即便中断也只记真正成功的部分，
                     # 没转成功的下轮扫描会自动补，不漏也不重。
                     baseline_ids |= set(f["fid"] for f in chunk if f.get("fid"))
@@ -352,6 +382,11 @@ def add_and_baseline(share_url, target_path, interval_min, pdir_fid="",
         finally:
             if hold:
                 sch._busy.discard(mid)
+
+        # 记住子目录 fid：在光鸭里给这些文件夹改名后，下次仍能转进同一个目录，
+        # 不会因为"按名字找不到"而新建一个原名目录、把一部剧拆成两份。
+        if dir_cache:
+            monitor_store.update(mid, dir_fids=dir_cache)
 
         if note2:
             st = "invalid" if fatal else "error"
